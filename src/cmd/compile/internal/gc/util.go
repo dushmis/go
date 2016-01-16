@@ -4,28 +4,10 @@ import (
 	"os"
 	"runtime"
 	"runtime/pprof"
-	"strconv"
 )
 
 func (n *Node) Line() string {
 	return Ctxt.LineHist.LineString(int(n.Lineno))
-}
-
-func atoi(s string) int {
-	// NOTE: Not strconv.Atoi, accepts hex and octal prefixes.
-	n, _ := strconv.ParseInt(s, 0, 0)
-	return int(n)
-}
-
-// strings.Compare, introduced in Go 1.5.
-func stringsCompare(a, b string) int {
-	if a == b {
-		return 0
-	}
-	if a < b {
-		return -1
-	}
-	return +1
 }
 
 var atExitFuncs []func()

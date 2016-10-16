@@ -14,8 +14,8 @@ TEXT runtime·sys_umtx_op(SB),NOSPLIT,$0
 	MOVQ addr+0(FP), DI
 	MOVL mode+8(FP), SI
 	MOVL val+12(FP), DX
-	MOVQ ptr2+16(FP), R10
-	MOVQ ts+24(FP), R8
+	MOVQ uaddr1+16(FP), R10
+	MOVQ ut+24(FP), R8
 	MOVL $454, AX
 	SYSCALL
 	MOVL	AX, ret+32(FP)
@@ -229,8 +229,8 @@ TEXT runtime·madvise(SB),NOSPLIT,$0
 	RET
 	
 TEXT runtime·sigaltstack(SB),NOSPLIT,$-8
-	MOVQ	new+8(SP), DI
-	MOVQ	old+16(SP), SI
+	MOVQ	new+0(FP), DI
+	MOVQ	old+8(FP), SI
 	MOVQ	$53, AX
 	SYSCALL
 	JCC	2(PC)
@@ -311,11 +311,11 @@ TEXT runtime·kqueue(SB),NOSPLIT,$0
 
 // int32 runtime·kevent(int kq, Kevent *changelist, int nchanges, Kevent *eventlist, int nevents, Timespec *timeout);
 TEXT runtime·kevent(SB),NOSPLIT,$0
-	MOVL	fd+0(FP), DI
-	MOVQ	ev1+8(FP), SI
-	MOVL	nev1+16(FP), DX
-	MOVQ	ev2+24(FP), R10
-	MOVL	nev2+32(FP), R8
+	MOVL	kq+0(FP), DI
+	MOVQ	ch+8(FP), SI
+	MOVL	nch+16(FP), DX
+	MOVQ	ev+24(FP), R10
+	MOVL	nev+32(FP), R8
 	MOVQ	ts+40(FP), R9
 	MOVL	$363, AX
 	SYSCALL

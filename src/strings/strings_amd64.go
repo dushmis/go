@@ -1,13 +1,25 @@
-// Copyright 2015 The Go Authors.  All rights reserved.
+// Copyright 2015 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
 package strings
 
+//go:noescape
+
 // indexShortStr returns the index of the first instance of c in s, or -1 if c is not present in s.
 // indexShortStr requires 2 <= len(c) <= shortStringLen
 func indexShortStr(s, c string) int // ../runtime/asm_$GOARCH.s
-const shortStringLen = 31
+func supportAVX2() bool             // ../runtime/asm_$GOARCH.s
+
+var shortStringLen int
+
+func init() {
+	if supportAVX2() {
+		shortStringLen = 63
+	} else {
+		shortStringLen = 31
+	}
+}
 
 // Index returns the index of the first instance of sep in s, or -1 if sep is not present in s.
 func Index(s, sep string) int {

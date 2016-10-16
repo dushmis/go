@@ -212,7 +212,7 @@ TEXT runtime·nanotime(SB),NOSPLIT,$24-8
 	RET
 
 TEXT runtime·rtsigprocmask(SB),NOSPLIT,$-8-28
-	MOVW	sig+0(FP), R0
+	MOVW	how+0(FP), R0
 	MOVD	new+8(FP), R1
 	MOVD	old+16(FP), R2
 	MOVW	size+24(FP), R3
@@ -259,6 +259,10 @@ TEXT runtime·sigtramp(SB),NOSPLIT,$24
 	BL	(R0)
 	RET
 
+TEXT runtime·cgoSigtramp(SB),NOSPLIT,$0
+	MOVD	$runtime·sigtramp(SB), R3
+	B	(R3)
+
 TEXT runtime·mmap(SB),NOSPLIT,$-8
 	MOVD	addr+0(FP), R0
 	MOVD	n+8(FP), R1
@@ -269,6 +273,9 @@ TEXT runtime·mmap(SB),NOSPLIT,$-8
 
 	MOVD	$SYS_mmap, R8
 	SVC
+	CMN	$4095, R0
+	BCC	2(PC)
+	NEG	R0,R0
 	MOVD	R0, ret+32(FP)
 	RET
 
@@ -312,8 +319,8 @@ TEXT runtime·clone(SB),NOSPLIT,$-8
 	MOVD	stk+8(FP), R1
 
 	// Copy mp, gp, fn off parent stack for use by child.
-	MOVD	mm+16(FP), R10
-	MOVD	gg+24(FP), R11
+	MOVD	mp+16(FP), R10
+	MOVD	gp+24(FP), R11
 	MOVD	fn+32(FP), R12
 
 	MOVD	R10, -8(R1)

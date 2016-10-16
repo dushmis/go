@@ -207,6 +207,7 @@ type OmitAttrTest struct {
 	Bool  bool    `xml:",attr,omitempty"`
 	Str   string  `xml:",attr,omitempty"`
 	Bytes []byte  `xml:",attr,omitempty"`
+	PStr  *string `xml:",attr,omitempty"`
 }
 
 type OmitFieldTest struct {
@@ -217,6 +218,7 @@ type OmitFieldTest struct {
 	Bool  bool          `xml:",omitempty"`
 	Str   string        `xml:",omitempty"`
 	Bytes []byte        `xml:",omitempty"`
+	PStr  *string       `xml:",omitempty"`
 	Ptr   *PresenceTest `xml:",omitempty"`
 }
 
@@ -317,6 +319,10 @@ func (m *MyMarshalerAttrTest) MarshalXMLAttr(name Name) (Attr, error) {
 	return Attr{name, "hello world"}, nil
 }
 
+func (m *MyMarshalerAttrTest) UnmarshalXMLAttr(attr Attr) error {
+	return nil
+}
+
 type MarshalerStruct struct {
 	Foo MyMarshalerAttrTest `xml:",attr"`
 }
@@ -373,6 +379,7 @@ var (
 	nameAttr     = "Sarah"
 	ageAttr      = uint(12)
 	contentsAttr = "lorem ipsum"
+	empty = ""
 )
 
 // Unless explicitly stated as such (or *Plain), all of the
@@ -831,9 +838,10 @@ var marshalTests = []struct {
 			Bool:  true,
 			Str:   "str",
 			Bytes: []byte("byt"),
+			PStr:  &empty,
 		},
 		ExpectXML: `<OmitAttrTest Int="8" int="9" Float="23.5" Uint8="255"` +
-			` Bool="true" Str="str" Bytes="byt"></OmitAttrTest>`,
+			` Bool="true" Str="str" Bytes="byt" PStr=""></OmitAttrTest>`,
 	},
 	{
 		Value:     &OmitAttrTest{},
@@ -864,6 +872,7 @@ var marshalTests = []struct {
 			Bool:  true,
 			Str:   "str",
 			Bytes: []byte("byt"),
+			PStr:   &empty,
 			Ptr:   &PresenceTest{},
 		},
 		ExpectXML: `<OmitFieldTest>` +
@@ -874,6 +883,7 @@ var marshalTests = []struct {
 			`<Bool>true</Bool>` +
 			`<Str>str</Str>` +
 			`<Bytes>byt</Bytes>` +
+			`<PStr></PStr>` +
 			`<Ptr></Ptr>` +
 			`</OmitFieldTest>`,
 	},
@@ -1732,7 +1742,7 @@ func TestDecodeEncode(t *testing.T) {
 	in.WriteString(`<?xml version="1.0" encoding="UTF-8"?>
 <?Target Instruction?>
 <root>
-</root>	
+</root>
 `)
 	dec := NewDecoder(&in)
 	enc := NewEncoder(&out)
@@ -1821,5 +1831,16 @@ func TestSimpleUseOfEncodeToken(t *testing.T) {
 	want := "<object2></object2>"
 	if buf.String() != want {
 		t.Errorf("enc.EncodeToken: expected %q; got %q", want, buf.String())
+	}
+}
+
+// Issue 16158. Decoder.unmarshalAttr ignores the return value of copyValue.
+func TestIssue16158(t *testing.T) {
+	const data = `<foo b="HELLOWORLD"></foo>`
+	err := Unmarshal([]byte(data), &struct {
+		B byte `xml:"b,attr,omitempty"`
+	}{})
+	if err == nil {
+		t.Errorf("Unmarshal: expected error, got nil")
 	}
 }

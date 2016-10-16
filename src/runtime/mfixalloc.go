@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// Fixed-size object allocator.  Returned memory is not zeroed.
+// Fixed-size object allocator. Returned memory is not zeroed.
 //
 // See malloc.go for overview.
 
@@ -18,6 +18,8 @@ import "unsafe"
 // The caller is responsible for locking around FixAlloc calls.
 // Callers can keep state in the object but the first word is
 // smashed by freeing and reallocating.
+//
+// Consider marking fixalloc'd types go:notinheap.
 type fixalloc struct {
 	size   uintptr
 	first  func(arg, p unsafe.Pointer) // called first time p is returned
@@ -30,10 +32,12 @@ type fixalloc struct {
 }
 
 // A generic linked list of blocks.  (Typically the block is bigger than sizeof(MLink).)
-// Since assignments to mlink.next will result in a write barrier being preformed
-// this can not be used by some of the internal GC structures. For example when
+// Since assignments to mlink.next will result in a write barrier being performed
+// this cannot be used by some of the internal GC structures. For example when
 // the sweeper is placing an unmarked object on the free list it does not want the
 // write barrier to be called since that could result in the object being reachable.
+//
+//go:notinheap
 type mlink struct {
 	next *mlink
 }

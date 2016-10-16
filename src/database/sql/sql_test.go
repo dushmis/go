@@ -5,6 +5,7 @@
 package sql
 
 import (
+	"context"
 	"database/sql/driver"
 	"errors"
 	"fmt"
@@ -144,7 +145,7 @@ func closeDB(t testing.TB, db *DB) {
 	count := db.numOpen
 	db.mu.Unlock()
 	if count != 0 {
-		t.Fatalf("%d connections still open after closing DB", db.numOpen)
+		t.Fatalf("%d connections still open after closing DB", count)
 	}
 }
 
@@ -248,6 +249,140 @@ func TestQuery(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("mismatch.\n got: %#v\nwant: %#v", got, want)
+	}
+
+	// And verify that the final rows.Next() call, which hit EOF,
+	// also closed the rows connection.
+	if n := db.numFreeConns(); n != 1 {
+		t.Fatalf("free conns after query hitting EOF = %d; want 1", n)
+	}
+	if prepares := numPrepares(t, db) - prepares0; prepares != 1 {
+		t.Errorf("executed %d Prepare statements; want 1", prepares)
+	}
+}
+
+func TestQueryContext(t *testing.T) {
+	db := newTestDB(t, "people")
+	defer closeDB(t, db)
+	prepares0 := numPrepares(t, db)
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	rows, err := db.QueryContext(ctx, "SELECT|people|age,name|")
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	type row struct {
+		age  int
+		name string
+	}
+	got := []row{}
+	index := 0
+	for rows.Next() {
+		if index == 2 {
+			cancel()
+			time.Sleep(10 * time.Millisecond)
+		}
+		var r row
+		err = rows.Scan(&r.age, &r.name)
+		if err != nil {
+			if index == 2 {
+				break
+			}
+			t.Fatalf("Scan: %v", err)
+		}
+		if index == 2 && err == nil {
+			t.Fatal("expected an error on last scan")
+		}
+		got = append(got, r)
+		index++
+	}
+	err = rows.Err()
+	if err != nil {
+		t.Fatalf("Err: %v", err)
+	}
+	want := []row{
+		{age: 1, name: "Alice"},
+		{age: 2, name: "Bob"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("mismatch.\n got: %#v\nwant: %#v", got, want)
+	}
+
+	// And verify that the final rows.Next() call, which hit EOF,
+	// also closed the rows connection.
+	if n := db.numFreeConns(); n != 1 {
+		t.Fatalf("free conns after query hitting EOF = %d; want 1", n)
+	}
+	if prepares := numPrepares(t, db) - prepares0; prepares != 1 {
+		t.Errorf("executed %d Prepare statements; want 1", prepares)
+	}
+}
+
+func TestMultiResultSetQuery(t *testing.T) {
+	db := newTestDB(t, "people")
+	defer closeDB(t, db)
+	prepares0 := numPrepares(t, db)
+	rows, err := db.Query("SELECT|people|age,name|;SELECT|people|name|")
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	type row1 struct {
+		age  int
+		name string
+	}
+	type row2 struct {
+		name string
+	}
+	got1 := []row1{}
+	for rows.Next() {
+		var r row1
+		err = rows.Scan(&r.age, &r.name)
+		if err != nil {
+			t.Fatalf("Scan: %v", err)
+		}
+		got1 = append(got1, r)
+	}
+	err = rows.Err()
+	if err != nil {
+		t.Fatalf("Err: %v", err)
+	}
+	want1 := []row1{
+		{age: 1, name: "Alice"},
+		{age: 2, name: "Bob"},
+		{age: 3, name: "Chris"},
+	}
+	if !reflect.DeepEqual(got1, want1) {
+		t.Errorf("mismatch.\n got1: %#v\nwant: %#v", got1, want1)
+	}
+
+	if !rows.NextResultSet() {
+		t.Errorf("expected another result set")
+	}
+
+	got2 := []row2{}
+	for rows.Next() {
+		var r row2
+		err = rows.Scan(&r.name)
+		if err != nil {
+			t.Fatalf("Scan: %v", err)
+		}
+		got2 = append(got2, r)
+	}
+	err = rows.Err()
+	if err != nil {
+		t.Fatalf("Err: %v", err)
+	}
+	want2 := []row2{
+		{name: "Alice"},
+		{name: "Bob"},
+		{name: "Chris"},
+	}
+	if !reflect.DeepEqual(got2, want2) {
+		t.Errorf("mismatch.\n got: %#v\nwant: %#v", got2, want2)
+	}
+	if rows.NextResultSet() {
+		t.Errorf("expected no more result sets")
 	}
 
 	// And verify that the final rows.Next() call, which hit EOF,
@@ -911,7 +1046,7 @@ func nullTestRun(t *testing.T, spec nullTestSpec) {
 	if err == nil {
 		// TODO: this test fails, but it's just because
 		// fakeConn implements the optional Execer interface,
-		// so arguably this is the correct behavior.  But
+		// so arguably this is the correct behavior. But
 		// maybe I should flesh out the fakeConn.Exec
 		// implementation so this properly fails.
 		// t.Errorf("expected error inserting nil name with Exec")
@@ -1159,17 +1294,19 @@ func TestMaxOpenConnsOnBusy(t *testing.T) {
 
 	db.SetMaxOpenConns(3)
 
-	conn0, err := db.conn(cachedOrNewConn)
+	ctx := context.Background()
+
+	conn0, err := db.conn(ctx, cachedOrNewConn)
 	if err != nil {
 		t.Fatalf("db open conn fail: %v", err)
 	}
 
-	conn1, err := db.conn(cachedOrNewConn)
+	conn1, err := db.conn(ctx, cachedOrNewConn)
 	if err != nil {
 		t.Fatalf("db open conn fail: %v", err)
 	}
 
-	conn2, err := db.conn(cachedOrNewConn)
+	conn2, err := db.conn(ctx, cachedOrNewConn)
 	if err != nil {
 		t.Fatalf("db open conn fail: %v", err)
 	}
@@ -1239,7 +1376,7 @@ func TestPendingConnsAfterErr(t *testing.T) {
 	time.Sleep(10 * time.Millisecond) // make extra sure all workers are blocked
 	close(unblock)                    // let all workers proceed
 
-	const timeout = 100 * time.Millisecond
+	const timeout = 5 * time.Second
 	to := time.NewTimer(timeout)
 	defer to.Stop()
 
@@ -1591,7 +1728,7 @@ func TestStmtCloseOrder(t *testing.T) {
 
 	_, err := db.Query("SELECT|non_existent|name|")
 	if err == nil {
-		t.Fatal("Quering non-existent table should fail")
+		t.Fatal("Querying non-existent table should fail")
 	}
 }
 
@@ -1615,6 +1752,8 @@ func TestManyErrBadConn(t *testing.T) {
 			}
 		}()
 
+		db.mu.Lock()
+		defer db.mu.Unlock()
 		if db.numOpen != nconn {
 			t.Fatalf("unexpected numOpen %d (was expecting %d)", db.numOpen, nconn)
 		} else if len(db.freeConn) != nconn {
@@ -2295,6 +2434,53 @@ func TestConnectionLeak(t *testing.T) {
 	// connection.
 	drv.waitCh <- struct{}{}
 	wg.Wait()
+}
+
+// badConn implements a bad driver.Conn, for TestBadDriver.
+// The Exec method panics.
+type badConn struct{}
+
+func (bc badConn) Prepare(query string) (driver.Stmt, error) {
+	return nil, errors.New("badConn Prepare")
+}
+
+func (bc badConn) Close() error {
+	return nil
+}
+
+func (bc badConn) Begin() (driver.Tx, error) {
+	return nil, errors.New("badConn Begin")
+}
+
+func (bc badConn) Exec(query string, args []driver.Value) (driver.Result, error) {
+	panic("badConn.Exec")
+}
+
+// badDriver is a driver.Driver that uses badConn.
+type badDriver struct{}
+
+func (bd badDriver) Open(name string) (driver.Conn, error) {
+	return badConn{}, nil
+}
+
+// Issue 15901.
+func TestBadDriver(t *testing.T) {
+	Register("bad", badDriver{})
+	db, err := Open("bad", "ignored")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("expected panic")
+		} else {
+			if want := "badConn.Exec"; r.(string) != want {
+				t.Errorf("panic was %v, expected %v", r, want)
+			}
+		}
+	}()
+	defer db.Close()
+	db.Exec("ignored")
 }
 
 func BenchmarkConcurrentDBExec(b *testing.B) {

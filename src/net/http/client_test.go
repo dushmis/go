@@ -8,6 +8,7 @@ package http_test
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
@@ -20,6 +21,7 @@ import (
 	. "net/http"
 	"net/http/httptest"
 	"net/url"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -240,7 +242,9 @@ func TestClientRedirects(t *testing.T) {
 
 	var checkErr error
 	var lastVia []*Request
-	c = &Client{CheckRedirect: func(_ *Request, via []*Request) error {
+	var lastReq *Request
+	c = &Client{CheckRedirect: func(req *Request, via []*Request) error {
+		lastReq = req
 		lastVia = via
 		return checkErr
 	}}
@@ -260,6 +264,20 @@ func TestClientRedirects(t *testing.T) {
 		t.Errorf("expected lastVia to have contained %d elements; got %d", e, g)
 	}
 
+	// Test that Request.Cancel is propagated between requests (Issue 14053)
+	creq, _ := NewRequest("HEAD", ts.URL, nil)
+	cancel := make(chan struct{})
+	creq.Cancel = cancel
+	if _, err := c.Do(creq); err != nil {
+		t.Fatal(err)
+	}
+	if lastReq == nil {
+		t.Fatal("didn't see redirect")
+	}
+	if lastReq.Cancel != cancel {
+		t.Errorf("expected lastReq to have the cancel channel set on the initial req")
+	}
+
 	checkErr = errors.New("no redirects allowed")
 	res, err = c.Get(ts.URL)
 	if urlError, ok := err.(*url.Error); !ok || urlError.Err != checkErr {
@@ -271,6 +289,33 @@ func TestClientRedirects(t *testing.T) {
 	res.Body.Close()
 	if res.Header.Get("Location") == "" {
 		t.Errorf("no Location header in Response")
+	}
+}
+
+func TestClientRedirectContext(t *testing.T) {
+	defer afterTest(t)
+	ts := httptest.NewServer(HandlerFunc(func(w ResponseWriter, r *Request) {
+		Redirect(w, r, "/", StatusFound)
+	}))
+	defer ts.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	c := &Client{CheckRedirect: func(req *Request, via []*Request) error {
+		cancel()
+		if len(via) > 2 {
+			return errors.New("too many redirects")
+		}
+		return nil
+	}}
+	req, _ := NewRequest("GET", ts.URL, nil)
+	req = req.WithContext(ctx)
+	_, err := c.Do(req)
+	ue, ok := err.(*url.Error)
+	if !ok {
+		t.Fatalf("got error %T; want *url.Error", err)
+	}
+	if ue.Err != context.Canceled {
+		t.Errorf("url.Error.Err = %v; want %v", ue.Err, context.Canceled)
 	}
 }
 
@@ -319,6 +364,44 @@ func TestPostRedirects(t *testing.T) {
 	want := "POST / POST /?code=301 POST /?code=302 GET / POST /?code=303 GET / POST /?code=404 "
 	if got != want {
 		t.Errorf("Log differs.\n Got: %q\nWant: %q", got, want)
+	}
+}
+
+func TestClientRedirectUseResponse(t *testing.T) {
+	defer afterTest(t)
+	const body = "Hello, world."
+	var ts *httptest.Server
+	ts = httptest.NewServer(HandlerFunc(func(w ResponseWriter, r *Request) {
+		if strings.Contains(r.URL.Path, "/other") {
+			io.WriteString(w, "wrong body")
+		} else {
+			w.Header().Set("Location", ts.URL+"/other")
+			w.WriteHeader(StatusFound)
+			io.WriteString(w, body)
+		}
+	}))
+	defer ts.Close()
+
+	c := &Client{CheckRedirect: func(req *Request, via []*Request) error {
+		if req.Response == nil {
+			t.Error("expected non-nil Request.Response")
+		}
+		return ErrUseLastResponse
+	}}
+	res, err := c.Get(ts.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.StatusCode != StatusFound {
+		t.Errorf("status = %d; want %d", res.StatusCode, StatusFound)
+	}
+	defer res.Body.Close()
+	slurp, err := ioutil.ReadAll(res.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(slurp) != body {
+		t.Errorf("body = %q; want %q", slurp, body)
 	}
 }
 
@@ -1122,5 +1205,204 @@ func TestReferer(t *testing.T) {
 		if r != tt.want {
 			t.Errorf("refererForURL(%q, %q) = %q; want %q", tt.lastReq, tt.newReq, r, tt.want)
 		}
+	}
+}
+
+// issue15577Tripper returns a Response with a redirect response
+// header and doesn't populate its Response.Request field.
+type issue15577Tripper struct{}
+
+func (issue15577Tripper) RoundTrip(*Request) (*Response, error) {
+	resp := &Response{
+		StatusCode: 303,
+		Header:     map[string][]string{"Location": {"http://www.example.com/"}},
+		Body:       ioutil.NopCloser(strings.NewReader("")),
+	}
+	return resp, nil
+}
+
+// Issue 15577: don't assume the roundtripper's response populates its Request field.
+func TestClientRedirectResponseWithoutRequest(t *testing.T) {
+	c := &Client{
+		CheckRedirect: func(*Request, []*Request) error { return fmt.Errorf("no redirects!") },
+		Transport:     issue15577Tripper{},
+	}
+	// Check that this doesn't crash:
+	c.Get("http://dummy.tld")
+}
+
+// Issue 4800: copy (some) headers when Client follows a redirect
+func TestClientCopyHeadersOnRedirect(t *testing.T) {
+	const (
+		ua   = "some-agent/1.2"
+		xfoo = "foo-val"
+	)
+	var ts2URL string
+	ts1 := httptest.NewServer(HandlerFunc(func(w ResponseWriter, r *Request) {
+		want := Header{
+			"User-Agent":      []string{ua},
+			"X-Foo":           []string{xfoo},
+			"Referer":         []string{ts2URL},
+			"Accept-Encoding": []string{"gzip"},
+		}
+		if !reflect.DeepEqual(r.Header, want) {
+			t.Errorf("Request.Header = %#v; want %#v", r.Header, want)
+		}
+		if t.Failed() {
+			w.Header().Set("Result", "got errors")
+		} else {
+			w.Header().Set("Result", "ok")
+		}
+	}))
+	defer ts1.Close()
+	ts2 := httptest.NewServer(HandlerFunc(func(w ResponseWriter, r *Request) {
+		Redirect(w, r, ts1.URL, StatusFound)
+	}))
+	defer ts2.Close()
+	ts2URL = ts2.URL
+
+	tr := &Transport{}
+	defer tr.CloseIdleConnections()
+	c := &Client{
+		Transport: tr,
+		CheckRedirect: func(r *Request, via []*Request) error {
+			want := Header{
+				"User-Agent": []string{ua},
+				"X-Foo":      []string{xfoo},
+				"Referer":    []string{ts2URL},
+			}
+			if !reflect.DeepEqual(r.Header, want) {
+				t.Errorf("CheckRedirect Request.Header = %#v; want %#v", r.Header, want)
+			}
+			return nil
+		},
+	}
+
+	req, _ := NewRequest("GET", ts2.URL, nil)
+	req.Header.Add("User-Agent", ua)
+	req.Header.Add("X-Foo", xfoo)
+	req.Header.Add("Cookie", "foo=bar")
+	req.Header.Add("Authorization", "secretpassword")
+	res, err := c.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != 200 {
+		t.Fatal(res.Status)
+	}
+	if got := res.Header.Get("Result"); got != "ok" {
+		t.Errorf("result = %q; want ok", got)
+	}
+}
+
+// Part of Issue 4800
+func TestShouldCopyHeaderOnRedirect(t *testing.T) {
+	tests := []struct {
+		header     string
+		initialURL string
+		destURL    string
+		want       bool
+	}{
+		{"User-Agent", "http://foo.com/", "http://bar.com/", true},
+		{"X-Foo", "http://foo.com/", "http://bar.com/", true},
+
+		// Sensitive headers:
+		{"cookie", "http://foo.com/", "http://bar.com/", false},
+		{"cookie2", "http://foo.com/", "http://bar.com/", false},
+		{"authorization", "http://foo.com/", "http://bar.com/", false},
+		{"www-authenticate", "http://foo.com/", "http://bar.com/", false},
+
+		// But subdomains should work:
+		{"www-authenticate", "http://foo.com/", "http://foo.com/", true},
+		{"www-authenticate", "http://foo.com/", "http://sub.foo.com/", true},
+		{"www-authenticate", "http://foo.com/", "http://notfoo.com/", false},
+		// TODO(bradfitz): make this test work, once issue 16142 is fixed:
+		// {"www-authenticate", "http://foo.com:80/", "http://foo.com/", true},
+	}
+	for i, tt := range tests {
+		u0, err := url.Parse(tt.initialURL)
+		if err != nil {
+			t.Errorf("%d. initial URL %q parse error: %v", i, tt.initialURL, err)
+			continue
+		}
+		u1, err := url.Parse(tt.destURL)
+		if err != nil {
+			t.Errorf("%d. dest URL %q parse error: %v", i, tt.destURL, err)
+			continue
+		}
+		got := Export_shouldCopyHeaderOnRedirect(tt.header, u0, u1)
+		if got != tt.want {
+			t.Errorf("%d. shouldCopyHeaderOnRedirect(%q, %q => %q) = %v; want %v",
+				i, tt.header, tt.initialURL, tt.destURL, got, tt.want)
+		}
+	}
+}
+
+func TestClientRedirectTypes(t *testing.T) {
+	defer afterTest(t)
+
+	tests := [...]struct {
+		broken       int // broken is bug number
+		method       string
+		serverStatus int
+		wantMethod   string // desired subsequent client method
+	}{
+		0: {method: "POST", serverStatus: 301, wantMethod: "GET"},
+		1: {method: "POST", serverStatus: 302, wantMethod: "GET"},
+		2: {method: "POST", serverStatus: 307, wantMethod: "POST", broken: 16840},
+
+		5: {method: "GET", serverStatus: 301, wantMethod: "GET"},
+		6: {method: "GET", serverStatus: 302, wantMethod: "GET"},
+		7: {method: "GET", serverStatus: 303, wantMethod: "GET"},
+		8: {method: "GET", serverStatus: 307, wantMethod: "GET"},
+		9: {method: "GET", serverStatus: 308, wantMethod: "GET"},
+
+		10: {method: "DELETE", serverStatus: 308, wantMethod: "DELETE", broken: 13994},
+	}
+
+	handlerc := make(chan HandlerFunc, 1)
+
+	ts := httptest.NewServer(HandlerFunc(func(rw ResponseWriter, req *Request) {
+		h := <-handlerc
+		h(rw, req)
+	}))
+	defer ts.Close()
+
+	for i, tt := range tests {
+		if tt.broken != 0 {
+			t.Logf("#%d: skipping known broken test case. See Issue #%d", i, tt.broken)
+			continue
+		}
+
+		handlerc <- func(w ResponseWriter, r *Request) {
+			w.Header().Set("Location", ts.URL)
+			w.WriteHeader(tt.serverStatus)
+		}
+
+		req, err := NewRequest(tt.method, ts.URL, nil)
+		if err != nil {
+			t.Errorf("#%d: NewRequest: %v", i, err)
+			continue
+		}
+
+		c := &Client{}
+		c.CheckRedirect = func(req *Request, via []*Request) error {
+			if got, want := req.Method, tt.wantMethod; got != want {
+				return fmt.Errorf("#%d: got next method %q; want %q", i, got, want)
+			}
+			handlerc <- func(rw ResponseWriter, req *Request) {
+				// TODO: Check that the body is valid when we do 307 and 308 support
+			}
+			return nil
+		}
+
+		res, err := c.Do(req)
+		if err != nil {
+			t.Errorf("#%d: Response: %v", i, err)
+			continue
+		}
+
+		res.Body.Close()
 	}
 }

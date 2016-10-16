@@ -1,4 +1,4 @@
-// Copyright 2009 The Go Authors.  All rights reserved.
+// Copyright 2009 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
@@ -13,8 +13,6 @@ import (
 	"unicode/utf16"
 	"unsafe"
 )
-
-//go:generate go run mksyscall_windows.go -output zsyscall_windows.go syscall_windows.go security_windows.go
 
 type Handle uintptr
 
@@ -75,8 +73,6 @@ func UTF16PtrFromString(s string) (*uint16, error) {
 	}
 	return &a[0], nil
 }
-
-func Getpagesize() int { return 4096 }
 
 // Errno is the Windows error number.
 type Errno uintptr

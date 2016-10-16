@@ -13,6 +13,7 @@ import (
 	"hash/crc32"
 	"io"
 	"os"
+	"time"
 )
 
 var (
@@ -87,7 +88,7 @@ func (z *Reader) init(r io.ReaderAt, size int64) error {
 	z.File = make([]*File, 0, end.directoryRecords)
 	z.Comment = end.comment
 	rs := io.NewSectionReader(r, 0, size)
-	if _, err = rs.Seek(int64(end.directoryOffset), os.SEEK_SET); err != nil {
+	if _, err = rs.Seek(int64(end.directoryOffset), io.SeekStart); err != nil {
 		return err
 	}
 	buf := bufio.NewReader(rs)
@@ -118,8 +119,6 @@ func (z *Reader) init(r io.ReaderAt, size int64) error {
 // RegisterDecompressor registers or overrides a custom decompressor for a
 // specific method ID. If a decompressor for a given method is not found,
 // Reader will default to looking up the decompressor at the package level.
-//
-// Must not be called concurrently with Open on any Files in the Reader.
 func (z *Reader) RegisterDecompressor(method uint16, dcomp Decompressor) {
 	if z.decompressors == nil {
 		z.decompressors = make(map[uint16]Decompressor)
@@ -155,19 +154,18 @@ func (f *File) DataOffset() (offset int64, err error) {
 
 // Open returns a ReadCloser that provides access to the File's contents.
 // Multiple files may be read concurrently.
-func (f *File) Open() (rc io.ReadCloser, err error) {
+func (f *File) Open() (io.ReadCloser, error) {
 	bodyOffset, err := f.findBodyOffset()
 	if err != nil {
-		return
+		return nil, err
 	}
 	size := int64(f.CompressedSize64)
 	r := io.NewSectionReader(f.zipr, f.headerOffset+bodyOffset, size)
 	dcomp := f.zip.decompressor(f.Method)
 	if dcomp == nil {
-		err = ErrAlgorithm
-		return
+		return nil, ErrAlgorithm
 	}
-	rc = dcomp(r)
+	var rc io.ReadCloser = dcomp(r)
 	var desr io.Reader
 	if f.hasDataDescriptor() {
 		desr = io.NewSectionReader(f.zipr, f.headerOffset+bodyOffset+size, dataDescriptorLen)
@@ -178,7 +176,7 @@ func (f *File) Open() (rc io.ReadCloser, err error) {
 		f:    f,
 		desr: desr,
 	}
-	return
+	return rc, nil
 }
 
 type checksumReader struct {
@@ -292,13 +290,16 @@ func readDirectoryHeader(f *File, r io.Reader) error {
 		// Other zip authors might not even follow the basic format,
 		// and we'll just ignore the Extra content in that case.
 		b := readBuf(f.Extra)
+
+	Extras:
 		for len(b) >= 4 { // need at least tag and size
 			tag := b.uint16()
 			size := b.uint16()
 			if int(size) > len(b) {
 				break
 			}
-			if tag == zip64ExtraId {
+			switch tag {
+			case zip64ExtraId:
 				// update directory values from the zip64 extra block.
 				// They should only be consulted if the sizes read earlier
 				// are maxed out.
@@ -326,13 +327,58 @@ func readDirectoryHeader(f *File, r io.Reader) error {
 					}
 					f.headerOffset = int64(eb.uint64())
 				}
-				break
+				break Extras
+
+			case ntfsExtraId:
+				if size == 32 {
+					eb := readBuf(b[:size])
+					eb.uint32() // reserved
+					eb.uint16() // tag1
+					size1 := eb.uint16()
+					if size1 == 24 {
+						sub := readBuf(eb[:size1])
+						lo := sub.uint32()
+						hi := sub.uint32()
+						tick := (uint64(uint64(lo)|uint64(hi)<<32) - 116444736000000000) / 10000000
+						f.SetModTime(time.Unix(int64(tick), 0))
+					}
+				}
+				break Extras
+
+			case unixExtraId:
+				if size >= 12 {
+					eb := readBuf(b[:size])
+					eb.uint32()          // AcTime
+					epoch := eb.uint32() // ModTime
+					f.SetModTime(time.Unix(int64(epoch), 0))
+					break Extras
+				}
+			case exttsExtraId:
+				if size >= 3 {
+					eb := readBuf(b[:size])
+					flags := eb.uint8()  // Flags
+					epoch := eb.uint32() // AcTime/ModTime/CrTime
+					if flags&1 != 0 {
+						f.SetModTime(time.Unix(int64(epoch), 0))
+					}
+					break Extras
+				}
 			}
 			b = b[size:]
 		}
 	}
 
-	if needUSize || needCSize || needHeaderOffset {
+	// Assume that uncompressed size 2³²-1 could plausibly happen in
+	// an old zip32 file that was sharding inputs into the largest chunks
+	// possible (or is just malicious; search the web for 42.zip).
+	// If needUSize is true still, it means we didn't see a zip64 extension.
+	// As long as the compressed size is not also 2³²-1 (implausible)
+	// and the header is not also 2³²-1 (equally implausible),
+	// accept the uncompressed size 2³²-1 as valid.
+	// If nothing else, this keeps archive/zip working with 42.zip.
+	_ = needUSize
+
+	if needCSize || needHeaderOffset {
 		return ErrFormat
 	}
 
@@ -500,6 +546,12 @@ func findSignatureInBlock(b []byte) int {
 }
 
 type readBuf []byte
+
+func (b *readBuf) uint8() uint8 {
+	v := uint8((*b)[0])
+	*b = (*b)[1:]
+	return v
+}
 
 func (b *readBuf) uint16() uint16 {
 	v := binary.LittleEndian.Uint16(*b)

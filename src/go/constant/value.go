@@ -43,13 +43,14 @@ type Value interface {
 	// Kind returns the value kind.
 	Kind() Kind
 
-	// String returns a short, human-readable form of the value.
+	// String returns a short, quoted (human-readable) form of the value.
 	// For numeric values, the result may be an approximation;
 	// for String values the result may be a shortened string.
 	// Use ExactString for a string representing a value exactly.
 	String() string
 
-	// ExactString returns an exact, printable form of the value.
+	// ExactString returns an exact, quoted (human-readable) form of the value.
+	// If the Value is of Kind String, use StringVal to obtain the unquoted string.
 	ExactString() string
 
 	// Prevent external implementations.
@@ -96,7 +97,7 @@ func (x stringVal) String() string {
 		// only the first maxLen-3 runes; then add "...".
 		i := 0
 		for n := 0; n < maxLen-3; n++ {
-			_, size := utf8.DecodeRuneInString(s)
+			_, size := utf8.DecodeRuneInString(s[i:])
 			i += size
 		}
 		s = s[:i] + "..."
@@ -276,10 +277,10 @@ func smallRat(x *big.Float) bool {
 // MakeUnknown returns the Unknown value.
 func MakeUnknown() Value { return unknownVal{} }
 
-// MakeBool returns the Bool value for x.
+// MakeBool returns the Bool value for b.
 func MakeBool(b bool) Value { return boolVal(b) }
 
-// MakeString returns the String value for x.
+// MakeString returns the String value for s.
 func MakeString(s string) Value { return stringVal(s) }
 
 // MakeInt64 returns the Int value for x.
@@ -308,8 +309,8 @@ func MakeFloat64(x float64) Value {
 
 // MakeFromLiteral returns the corresponding integer, floating-point,
 // imaginary, character, or string value for a Go literal string. The
-// tok value must be one of token.INT, token.FLOAT, toke.IMAG, token.
-// CHAR, or token.STRING. The final argument must be zero.
+// tok value must be one of token.INT, token.FLOAT, token.IMAG,
+// token.CHAR, or token.STRING. The final argument must be zero.
 // If the literal string syntax is invalid, the result is an Unknown.
 func MakeFromLiteral(lit string, tok token.Token, zero uint) Value {
 	if zero != 0 {

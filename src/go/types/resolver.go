@@ -22,9 +22,14 @@ type declInfo struct {
 	init  ast.Expr      // init expression, or nil
 	fdecl *ast.FuncDecl // func declaration, or nil
 
-	deps map[Object]bool // type and init dependencies; lazily allocated
-	mark int             // for dependency analysis
+	// The deps field tracks initialization expression dependencies.
+	// As a special (overloaded) case, it also tracks dependencies of
+	// interface types on embedded interfaces (see ordering.go).
+	deps objSet // lazily initialized
 }
+
+// An objSet is simply a set of objects.
+type objSet map[Object]bool
 
 // hasInitializer reports whether the declared object has an initialization
 // expression or function body.
@@ -32,11 +37,11 @@ func (d *declInfo) hasInitializer() bool {
 	return d.init != nil || d.fdecl != nil && d.fdecl.Body != nil
 }
 
-// addDep adds obj as a dependency to d.
+// addDep adds obj to the set of objects d's init expression depends on.
 func (d *declInfo) addDep(obj Object) {
 	m := d.deps
 	if m == nil {
-		m = make(map[Object]bool)
+		m = make(objSet)
 		d.deps = m
 	}
 	m[obj] = true
@@ -67,7 +72,7 @@ func (check *Checker) arityMatch(s, init *ast.ValueSpec) {
 			// TODO(gri) avoid declared but not used error here
 		} else {
 			// init exprs "inherited"
-			check.errorf(s.Pos(), "extra init expr at %s", init.Pos())
+			check.errorf(s.Pos(), "extra init expr at %s", check.fset.Position(init.Pos()))
 			// TODO(gri) avoid declared but not used error here
 		}
 	case l > r && (init != nil || r != 1):
@@ -268,6 +273,9 @@ func (check *Checker) collectObjects() {
 							// declare imported package object in file scope
 							check.declare(fileScope, nil, obj, token.NoPos)
 						}
+
+					case *ast.AliasSpec:
+						check.errorf(s.Name.Pos(), "cannot handle alias declarations yet")
 
 					case *ast.ValueSpec:
 						switch d.Tok {
@@ -483,11 +491,9 @@ func pkgName(path string) string {
 // (Per the go/build package dependency tests, we cannot import
 // path/filepath and simply use filepath.Dir.)
 func dir(path string) string {
-	if i := strings.LastIndexAny(path, "/\\"); i >= 0 {
-		path = path[:i]
+	if i := strings.LastIndexAny(path, `/\`); i > 0 {
+		return path[:i]
 	}
-	if path == "" {
-		path = "."
-	}
-	return path
+	// i <= 0
+	return "."
 }

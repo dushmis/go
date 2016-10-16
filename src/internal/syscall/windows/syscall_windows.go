@@ -1,4 +1,4 @@
-// Copyright 2014 The Go Authors.  All rights reserved.
+// Copyright 2014 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
@@ -6,7 +6,10 @@ package windows
 
 import "syscall"
 
-//go:generate go run ../../../syscall/mksyscall_windows.go -output zsyscall_windows.go syscall_windows.go
+const (
+	ERROR_SHARING_VIOLATION      syscall.Errno = 32
+	ERROR_NO_UNICODE_TRANSLATION syscall.Errno = 1113
+)
 
 const GAA_FLAG_INCLUDE_PREFIX = 0x00000010
 
@@ -139,5 +142,9 @@ func Rename(oldpath, newpath string) error {
 	return MoveFileEx(from, to, MOVEFILE_REPLACE_EXISTING)
 }
 
+const MB_ERR_INVALID_CHARS = 8
+
 //sys	GetACP() (acp uint32) = kernel32.GetACP
+//sys	GetConsoleCP() (ccp uint32) = kernel32.GetConsoleCP
 //sys	MultiByteToWideChar(codePage uint32, dwFlags uint32, str *byte, nstr int32, wchar *uint16, nwchar int32) (nwrite int32, err error) = kernel32.MultiByteToWideChar
+//sys	GetCurrentThread() (pseudoHandle syscall.Handle, err error) = kernel32.GetCurrentThread

@@ -50,7 +50,7 @@ TEXT runtime·tfork(SB),NOSPLIT,$32
 	// Call fn
 	CALL	R12
 
-	// It shouldn't return.  If it does, exit
+	// It shouldn't return. If it does, exit
 	MOVQ	$0, DI			// arg 1 - notdead
 	MOVL	$302, AX		// sys___threxit
 	SYSCALL
@@ -218,8 +218,8 @@ TEXT runtime·sigaction(SB),NOSPLIT,$-8
 	MOVL	$0xf1, 0xf1		// crash
 	RET
 
-TEXT runtime·sigprocmask(SB),NOSPLIT,$0
-	MOVL	mode+0(FP), DI		// arg 1 - how
+TEXT runtime·obsdsigprocmask(SB),NOSPLIT,$0
+	MOVL	how+0(FP), DI		// arg 1 - how
 	MOVL	new+4(FP), SI		// arg 2 - set
 	MOVL	$48, AX			// sys_sigprocmask
 	SYSCALL
@@ -278,8 +278,8 @@ TEXT runtime·madvise(SB),NOSPLIT,$0
 	RET
 
 TEXT runtime·sigaltstack(SB),NOSPLIT,$-8
-	MOVQ	new+8(SP), DI		// arg 1 - nss
-	MOVQ	old+16(SP), SI		// arg 2 - oss
+	MOVQ	new+0(FP), DI		// arg 1 - nss
+	MOVQ	old+8(FP), SI		// arg 2 - oss
 	MOVQ	$288, AX		// sys_sigaltstack
 	SYSCALL
 	JCC	2(PC)
@@ -327,11 +327,11 @@ TEXT runtime·kqueue(SB),NOSPLIT,$0
 
 // int32 runtime·kevent(int kq, Kevent *changelist, int nchanges, Kevent *eventlist, int nevents, Timespec *timeout);
 TEXT runtime·kevent(SB),NOSPLIT,$0
-	MOVL	fd+0(FP), DI
-	MOVQ	ev1+8(FP), SI
-	MOVL	nev1+16(FP), DX
-	MOVQ	ev2+24(FP), R10
-	MOVL	nev2+32(FP), R8
+	MOVL	kq+0(FP), DI
+	MOVQ	ch+8(FP), SI
+	MOVL	nch+16(FP), DX
+	MOVQ	ev+24(FP), R10
+	MOVL	nev+32(FP), R8
 	MOVQ	ts+40(FP), R9
 	MOVL	$72, AX
 	SYSCALL

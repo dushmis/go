@@ -9,6 +9,150 @@ import (
 	"unsafe"
 )
 
+// Frames may be used to get function/file/line information for a
+// slice of PC values returned by Callers.
+type Frames struct {
+	callers []uintptr
+
+	// If previous caller in iteration was a panic, then
+	// ci.callers[0] is the address of the faulting instruction
+	// instead of the return address of the call.
+	wasPanic bool
+
+	// Frames to return for subsequent calls to the Next method.
+	// Used for non-Go frames.
+	frames *[]Frame
+}
+
+// Frame is the information returned by Frames for each call frame.
+type Frame struct {
+	// Program counter for this frame; multiple frames may have
+	// the same PC value.
+	PC uintptr
+
+	// Func for this frame; may be nil for non-Go code or fully
+	// inlined functions.
+	Func *Func
+
+	// Function name, file name, and line number for this call frame.
+	// May be the empty string or zero if not known.
+	// If Func is not nil then Function == Func.Name().
+	Function string
+	File     string
+	Line     int
+
+	// Entry point for the function; may be zero if not known.
+	// If Func is not nil then Entry == Func.Entry().
+	Entry uintptr
+}
+
+// CallersFrames takes a slice of PC values returned by Callers and
+// prepares to return function/file/line information.
+// Do not change the slice until you are done with the Frames.
+func CallersFrames(callers []uintptr) *Frames {
+	return &Frames{callers: callers}
+}
+
+// Next returns frame information for the next caller.
+// If more is false, there are no more callers (the Frame value is valid).
+func (ci *Frames) Next() (frame Frame, more bool) {
+	if ci.frames != nil {
+		// We have saved up frames to return.
+		f := (*ci.frames)[0]
+		if len(*ci.frames) == 1 {
+			ci.frames = nil
+		} else {
+			*ci.frames = (*ci.frames)[1:]
+		}
+		return f, ci.frames != nil || len(ci.callers) > 0
+	}
+
+	if len(ci.callers) == 0 {
+		ci.wasPanic = false
+		return Frame{}, false
+	}
+	pc := ci.callers[0]
+	ci.callers = ci.callers[1:]
+	more = len(ci.callers) > 0
+	f := FuncForPC(pc)
+	if f == nil {
+		ci.wasPanic = false
+		if cgoSymbolizer != nil {
+			return ci.cgoNext(pc, more)
+		}
+		return Frame{}, more
+	}
+
+	entry := f.Entry()
+	xpc := pc
+	if xpc > entry && !ci.wasPanic {
+		xpc--
+	}
+	file, line := f.FileLine(xpc)
+
+	function := f.Name()
+	ci.wasPanic = entry == sigpanicPC
+
+	frame = Frame{
+		PC:       xpc,
+		Func:     f,
+		Function: function,
+		File:     file,
+		Line:     line,
+		Entry:    entry,
+	}
+
+	return frame, more
+}
+
+// cgoNext returns frame information for pc, known to be a non-Go function,
+// using the cgoSymbolizer hook.
+func (ci *Frames) cgoNext(pc uintptr, more bool) (Frame, bool) {
+	arg := cgoSymbolizerArg{pc: pc}
+	callCgoSymbolizer(&arg)
+
+	if arg.file == nil && arg.funcName == nil {
+		// No useful information from symbolizer.
+		return Frame{}, more
+	}
+
+	var frames []Frame
+	for {
+		frames = append(frames, Frame{
+			PC:       pc,
+			Func:     nil,
+			Function: gostring(arg.funcName),
+			File:     gostring(arg.file),
+			Line:     int(arg.lineno),
+			Entry:    arg.entry,
+		})
+		if arg.more == 0 {
+			break
+		}
+		callCgoSymbolizer(&arg)
+	}
+
+	// No more frames for this PC. Tell the symbolizer we are done.
+	// We don't try to maintain a single cgoSymbolizerArg for the
+	// whole use of Frames, because there would be no good way to tell
+	// the symbolizer when we are done.
+	arg.pc = 0
+	callCgoSymbolizer(&arg)
+
+	if len(frames) == 1 {
+		// Return a single frame.
+		return frames[0], more
+	}
+
+	// Return the first frame we saw and store the rest to be
+	// returned by later calls to Next.
+	rf := frames[0]
+	frames = frames[1:]
+	ci.frames = new([]Frame)
+	*ci.frames = frames
+	return rf, true
+}
+
 // NOTE: Func does not expose the actual unexported fields, because we return *Func
 // values to users, and we want to keep them from being able to overwrite the data
 // with (say) *f = Func{}.
@@ -49,13 +193,20 @@ type moduledata struct {
 	bss, ebss             uintptr
 	noptrbss, enoptrbss   uintptr
 	end, gcdata, gcbss    uintptr
+	types, etypes         uintptr
 
-	typelinks []*_type
+	textsectmap []textsect
+	typelinks   []int32 // offsets from types
+	itablinks   []*itab
+
+	ptab []ptabEntry
 
 	modulename   string
 	modulehashes []modulehash
 
 	gcdatamask, gcbssmask bitvector
+
+	typemap map[typeOff]*_type // offset to *_rtype in previous module
 
 	next *moduledata
 }
@@ -78,6 +229,14 @@ type functab struct {
 	funcoff uintptr
 }
 
+// Mapping information for secondary text sections
+
+type textsect struct {
+	vaddr    uintptr // prelinked section vaddr
+	length   uintptr // section length
+	baseaddr uintptr // relocated section address
+}
+
 const minfunc = 16                 // minimum function size
 const pcbucketsize = 256 * minfunc // size of bucket in the pc->func lookup table
 
@@ -85,8 +244,8 @@ const pcbucketsize = 256 * minfunc // size of bucket in the pc->func lookup tabl
 // Each bucket represents 4096 bytes of the text segment.
 // Each subbucket represents 256 bytes of the text segment.
 // To find a function given a pc, locate the bucket and subbucket for
-// that pc.  Add together the idx and subbucket value to obtain a
-// function index.  Then scan the functab array starting at that
+// that pc. Add together the idx and subbucket value to obtain a
+// function index. Then scan the functab array starting at that
 // index to find the target function.
 // This table uses 20 bytes for every 4096 bytes of code, or ~0.5% overhead.
 type findfuncbucket struct {
@@ -199,7 +358,7 @@ func (f *Func) FileLine(pc uintptr) (file string, line int) {
 
 func findmoduledatap(pc uintptr) *moduledata {
 	for datap := &firstmoduledata; datap != nil; datap = datap.next {
-		if datap.minpc <= pc && pc <= datap.maxpc {
+		if datap.minpc <= pc && pc < datap.maxpc {
 			return datap
 		}
 	}
@@ -220,12 +379,23 @@ func findfunc(pc uintptr) *_func {
 	ffb := (*findfuncbucket)(add(unsafe.Pointer(datap.findfunctab), b*unsafe.Sizeof(findfuncbucket{})))
 	idx := ffb.idx + uint32(ffb.subbuckets[i])
 	if pc < datap.ftab[idx].entry {
-		throw("findfunc: bad findfunctab entry")
-	}
 
-	// linear search to find func with pc >= entry.
-	for datap.ftab[idx+1].entry <= pc {
-		idx++
+		// If there are multiple text sections then the buckets for the secondary
+		// text sections will be off because the addresses in those text sections
+		// were relocated to higher addresses.  Search back to find it.
+
+		for datap.ftab[idx].entry > pc && idx > 0 {
+			idx--
+		}
+		if idx == 0 {
+			throw("findfunc: bad findfunctab entry idx")
+		}
+	} else {
+
+		// linear search to find func with pc >= entry.
+		for datap.ftab[idx+1].entry <= pc {
+			idx++
+		}
 	}
 	return (*_func)(unsafe.Pointer(&datap.pclntable[datap.ftab[idx].funcoff]))
 }
@@ -289,7 +459,7 @@ func pcvalue(f *_func, off int32, targetpc uintptr, cache *pcvalueCache, strict 
 			// a recursive stack's cycle is slightly
 			// larger than the cache.
 			if cache != nil {
-				ci := fastrand1() % uint32(len(cache.entries))
+				ci := fastrand() % uint32(len(cache.entries))
 				cache.entries[ci] = pcvalueCacheEnt{
 					targetpc: targetpc,
 					off:      off,
@@ -433,5 +603,5 @@ func stackmapdata(stkmap *stackmap, n int32) bitvector {
 	if n < 0 || n >= stkmap.n {
 		throw("stackmapdata: index out of range")
 	}
-	return bitvector{stkmap.nbit, (*byte)(add(unsafe.Pointer(&stkmap.bytedata), uintptr(n*((stkmap.nbit+31)/32*4))))}
+	return bitvector{stkmap.nbit, (*byte)(add(unsafe.Pointer(&stkmap.bytedata), uintptr(n*((stkmap.nbit+7)/8))))}
 }

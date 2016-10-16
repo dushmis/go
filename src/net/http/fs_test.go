@@ -5,6 +5,7 @@
 package http_test
 
 import (
+	"bufio"
 	"bytes"
 	"errors"
 	"fmt"
@@ -23,7 +24,6 @@ import (
 	"reflect"
 	"regexp"
 	"runtime"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -37,8 +37,6 @@ const (
 type wantRange struct {
 	start, end int64 // range [start,end)
 }
-
-var itoa = strconv.Itoa
 
 var ServeFileRangeTests = []struct {
 	r      string
@@ -177,6 +175,36 @@ Cases:
 	}
 }
 
+func TestServeFile_DotDot(t *testing.T) {
+	tests := []struct {
+		req        string
+		wantStatus int
+	}{
+		{"/testdata/file", 200},
+		{"/../file", 400},
+		{"/..", 400},
+		{"/../", 400},
+		{"/../foo", 400},
+		{"/..\\foo", 400},
+		{"/file/a", 200},
+		{"/file/a..", 200},
+		{"/file/a/..", 400},
+		{"/file/a\\..", 400},
+	}
+	for _, tt := range tests {
+		req, err := ReadRequest(bufio.NewReader(strings.NewReader("GET " + tt.req + " HTTP/1.1\r\nHost: foo\r\n\r\n")))
+		if err != nil {
+			t.Errorf("bad request %q: %v", tt.req, err)
+			continue
+		}
+		rec := httptest.NewRecorder()
+		ServeFile(rec, req, "testdata/file")
+		if rec.Code != tt.wantStatus {
+			t.Errorf("for request %q, status = %d; want %d", tt.req, rec.Code, tt.wantStatus)
+		}
+	}
+}
+
 var fsRedirectTestData = []struct {
 	original, redirect string
 }{
@@ -246,6 +274,7 @@ func TestFileServerEscapesNames(t *testing.T) {
 		{`"'<>&`, `<a href="%22%27%3C%3E&">&#34;&#39;&lt;&gt;&amp;</a>`},
 		{`?foo=bar#baz`, `<a href="%3Ffoo=bar%23baz">?foo=bar#baz</a>`},
 		{`<combo>?foo`, `<a href="%3Ccombo%3E%3Ffoo">&lt;combo&gt;?foo</a>`},
+		{`foo:bar`, `<a href="./foo:bar">foo:bar</a>`},
 	}
 
 	// We put each test file in its own directory in the fakeFS so we can look at it in isolation.
@@ -474,6 +503,24 @@ func TestServeFileFromCWD(t *testing.T) {
 	r.Body.Close()
 	if r.StatusCode != 200 {
 		t.Fatalf("expected 200 OK, got %s", r.Status)
+	}
+}
+
+// Issue 13996
+func TestServeDirWithoutTrailingSlash(t *testing.T) {
+	e := "/testdata/"
+	defer afterTest(t)
+	ts := httptest.NewServer(HandlerFunc(func(w ResponseWriter, r *Request) {
+		ServeFile(w, r, ".")
+	}))
+	defer ts.Close()
+	r, err := Get(ts.URL + "/testdata")
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Body.Close()
+	if g := r.Request.URL.Path; g != e {
+		t.Errorf("got %s, want %s", g, e)
 	}
 }
 
@@ -719,6 +766,7 @@ func TestServeContent(t *testing.T) {
 		reqHeader        map[string]string
 		wantLastMod      string
 		wantContentType  string
+		wantContentRange string
 		wantStatus       int
 	}
 	htmlModTime := mustStat(t, "testdata/index.html").ModTime()
@@ -774,8 +822,19 @@ func TestServeContent(t *testing.T) {
 			reqHeader: map[string]string{
 				"Range": "bytes=0-4",
 			},
-			wantStatus:      StatusPartialContent,
-			wantContentType: "text/css; charset=utf-8",
+			wantStatus:       StatusPartialContent,
+			wantContentType:  "text/css; charset=utf-8",
+			wantContentRange: "bytes 0-4/8",
+		},
+		"range_no_overlap": {
+			file:      "testdata/style.css",
+			serveETag: `"A"`,
+			reqHeader: map[string]string{
+				"Range": "bytes=10-20",
+			},
+			wantStatus:       StatusRequestedRangeNotSatisfiable,
+			wantContentType:  "text/plain; charset=utf-8",
+			wantContentRange: "bytes */8",
 		},
 		// An If-Range resource for entity "A", but entity "B" is now current.
 		// The Range request should be ignored.
@@ -796,9 +855,10 @@ func TestServeContent(t *testing.T) {
 				"Range":    "bytes=0-4",
 				"If-Range": "Wed, 25 Jun 2014 17:12:18 GMT",
 			},
-			wantStatus:      StatusPartialContent,
-			wantContentType: "text/css; charset=utf-8",
-			wantLastMod:     "Wed, 25 Jun 2014 17:12:18 GMT",
+			wantStatus:       StatusPartialContent,
+			wantContentType:  "text/css; charset=utf-8",
+			wantContentRange: "bytes 0-4/8",
+			wantLastMod:      "Wed, 25 Jun 2014 17:12:18 GMT",
 		},
 		"range_with_modtime_nanos": {
 			file:    "testdata/style.css",
@@ -807,9 +867,10 @@ func TestServeContent(t *testing.T) {
 				"Range":    "bytes=0-4",
 				"If-Range": "Wed, 25 Jun 2014 17:12:18 GMT",
 			},
-			wantStatus:      StatusPartialContent,
-			wantContentType: "text/css; charset=utf-8",
-			wantLastMod:     "Wed, 25 Jun 2014 17:12:18 GMT",
+			wantStatus:       StatusPartialContent,
+			wantContentType:  "text/css; charset=utf-8",
+			wantContentRange: "bytes 0-4/8",
+			wantLastMod:      "Wed, 25 Jun 2014 17:12:18 GMT",
 		},
 		"unix_zero_modtime": {
 			content:         strings.NewReader("<html>foo"),
@@ -856,6 +917,9 @@ func TestServeContent(t *testing.T) {
 		}
 		if g, e := res.Header.Get("Content-Type"), tt.wantContentType; g != e {
 			t.Errorf("test %q: content-type = %q, want %q", testName, g, e)
+		}
+		if g, e := res.Header.Get("Content-Range"), tt.wantContentRange; g != e {
+			t.Errorf("test %q: content-range = %q, want %q", testName, g, e)
 		}
 		if g, e := res.Header.Get("Last-Modified"), tt.wantLastMod; g != e {
 			t.Errorf("test %q: last-modified = %q, want %q", testName, g, e)
@@ -932,9 +996,9 @@ func TestLinuxSendfile(t *testing.T) {
 
 	syscalls := "sendfile,sendfile64"
 	switch runtime.GOARCH {
-	case "mips64", "mips64le":
-		// mips64 strace doesn't support sendfile64 and will error out
-		// if we specify that with `-e trace='.
+	case "mips64", "mips64le", "s390x":
+		// strace on the above platforms doesn't support sendfile64
+		// and will error out if we specify that with `-e trace='.
 		syscalls = "sendfile"
 	}
 

@@ -168,6 +168,7 @@ TEXT runtime·mincore(SB),NOSPLIT,$-8-28
 	MOVV	dst+16(FP), R6
 	MOVV	$SYS_mincore, R2
 	SYSCALL
+	SUBVU	R2, R0, R2	// caller expects negative errno
 	MOVW	R2, ret+24(FP)
 	RET
 
@@ -203,7 +204,7 @@ TEXT runtime·nanotime(SB),NOSPLIT,$16
 	RET
 
 TEXT runtime·rtsigprocmask(SB),NOSPLIT,$-8-28
-	MOVW	sig+0(FP), R4
+	MOVW	how+0(FP), R4
 	MOVV	new+8(FP), R5
 	MOVV	old+16(FP), R6
 	MOVW	size+24(FP), R7
@@ -227,13 +228,15 @@ TEXT runtime·sigfwd(SB),NOSPLIT,$0-32
 	MOVW	sig+8(FP), R4
 	MOVV	info+16(FP), R5
 	MOVV	ctx+24(FP), R6
-	MOVV	fn+0(FP), R1
-	JAL	(R1)
+	MOVV	fn+0(FP), R25
+	JAL	(R25)
 	RET
 
 TEXT runtime·sigtramp(SB),NOSPLIT,$64
-	// initialize essential registers (just in case)
-	JAL	runtime·reginit(SB)
+	// initialize REGSB = PC&0xffffffff00000000
+	BGEZAL	R0, 1(PC)
+	SRLV	$32, R31, RSB
+	SLLV	$32, RSB
 
 	// this might be called in external code context,
 	// where g is not set.
@@ -247,6 +250,9 @@ TEXT runtime·sigtramp(SB),NOSPLIT,$64
 	MOVV	$runtime·sigtrampgo(SB), R1
 	JAL	(R1)
 	RET
+
+TEXT runtime·cgoSigtramp(SB),NOSPLIT,$0
+	JMP	runtime·sigtramp(SB)
 
 TEXT runtime·mmap(SB),NOSPLIT,$-8
 	MOVV	addr+0(FP), R4
@@ -300,8 +306,8 @@ TEXT runtime·clone(SB),NOSPLIT,$-8
 
 	// Copy mp, gp, fn off parent stack for use by child.
 	// Careful: Linux system call clobbers ???.
-	MOVV	mm+16(FP), R16
-	MOVV	gg+24(FP), R17
+	MOVV	mp+16(FP), R16
+	MOVV	gp+24(FP), R17
 	MOVV	fn+32(FP), R18
 
 	MOVV	R16, -8(R5)
@@ -319,8 +325,6 @@ TEXT runtime·clone(SB),NOSPLIT,$-8
 	RET
 
 	// In child, on new stack.
-	// initialize essential registers
-	JAL	runtime·reginit(SB)
 	MOVV	-32(R29), R16
 	MOVV	$1234, R1
 	BEQ	R16, R1, 2(PC)

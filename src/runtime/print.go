@@ -199,17 +199,13 @@ func printpointer(p unsafe.Pointer) {
 }
 
 func printstring(s string) {
-	if uintptr(len(s)) > maxstring {
-		gwrite(bytes("[string too long]"))
-		return
-	}
 	gwrite(bytes(s))
 }
 
 func printslice(s []byte) {
 	sp := (*slice)(unsafe.Pointer(&s))
 	print("[", len(s), "/", cap(s), "]")
-	printpointer(unsafe.Pointer(sp.array))
+	printpointer(sp.array)
 }
 
 func printeface(e eface) {

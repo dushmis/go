@@ -37,7 +37,7 @@ TEXT runtime·lwp_tramp(SB),NOSPLIT,$0
 	// Call fn
 	CALL	R12
 
-	// It shouldn't return.  If it does, exit.
+	// It shouldn't return. If it does, exit.
 	MOVL	$310, AX		// sys__lwp_exit
 	SYSCALL
 	JMP	-3(PC)			// keep exiting
@@ -207,7 +207,7 @@ TEXT runtime·getcontext(SB),NOSPLIT,$-8
 	RET
 
 TEXT runtime·sigprocmask(SB),NOSPLIT,$0
-	MOVL	mode+0(FP), DI		// arg 1 - how
+	MOVL	how+0(FP), DI		// arg 1 - how
 	MOVQ	new+8(FP), SI		// arg 2 - set
 	MOVQ	old+16(FP), DX		// arg 3 - oset
 	MOVL	$293, AX		// sys_sigprocmask
@@ -245,11 +245,13 @@ TEXT runtime·sigfwd(SB),NOSPLIT,$0-32
 	CALL	AX
 	RET
 
-TEXT runtime·sigtramp(SB),NOSPLIT,$24
+TEXT runtime·sigtramp(SB),NOSPLIT,$32
 	MOVQ	DI, 0(SP)   // signum
 	MOVQ	SI, 8(SP)   // info
 	MOVQ	DX, 16(SP)  // ctx
+	MOVQ	R15, 24(SP) // for sigreturn
 	CALL	runtime·sigtrampgo(SB)
+	MOVQ	24(SP), R15
 	RET
 
 TEXT runtime·mmap(SB),NOSPLIT,$0
@@ -288,8 +290,8 @@ TEXT runtime·madvise(SB),NOSPLIT,$0
 	RET
 
 TEXT runtime·sigaltstack(SB),NOSPLIT,$-8
-	MOVQ	new+8(SP), DI		// arg 1 - nss
-	MOVQ	old+16(SP), SI		// arg 2 - oss
+	MOVQ	new+0(FP), DI		// arg 1 - nss
+	MOVQ	old+8(FP), SI		// arg 2 - oss
 	MOVQ	$281, AX		// sys___sigaltstack14
 	SYSCALL
 	JCC	2(PC)
@@ -335,11 +337,11 @@ TEXT runtime·kqueue(SB),NOSPLIT,$0
 
 // int32 runtime·kevent(int kq, Kevent *changelist, int nchanges, Kevent *eventlist, int nevents, Timespec *timeout)
 TEXT runtime·kevent(SB),NOSPLIT,$0
-	MOVL	fd+0(FP), DI
-	MOVQ	ev1+8(FP), SI
-	MOVL	nev1+16(FP), DX
-	MOVQ	ev2+24(FP), R10
-	MOVL	nev2+32(FP), R8
+	MOVL	kq+0(FP), DI
+	MOVQ	ch+8(FP), SI
+	MOVL	nch+16(FP), DX
+	MOVQ	ev+24(FP), R10
+	MOVL	nev+32(FP), R8
 	MOVQ	ts+40(FP), R9
 	MOVL	$435, AX
 	SYSCALL

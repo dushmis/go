@@ -155,7 +155,7 @@ func (l *lexer) ignore() {
 
 // accept consumes the next rune if it's from the valid set.
 func (l *lexer) accept(valid string) bool {
-	if strings.IndexRune(valid, l.next()) >= 0 {
+	if strings.ContainsRune(valid, l.next()) {
 		return true
 	}
 	l.backup()
@@ -164,7 +164,7 @@ func (l *lexer) accept(valid string) bool {
 
 // acceptRun consumes a run of runes from the valid set.
 func (l *lexer) acceptRun(valid string) {
-	for strings.IndexRune(valid, l.next()) >= 0 {
+	for strings.ContainsRune(valid, l.next()) {
 	}
 	l.backup()
 }
@@ -236,24 +236,23 @@ const (
 
 // lexText scans until an opening action delimiter, "{{".
 func lexText(l *lexer) stateFn {
-	for {
-		delim, trimSpace := l.atLeftDelim()
-		if delim {
-			trimLength := Pos(0)
-			if trimSpace {
-				trimLength = rightTrimLength(l.input[l.start:l.pos])
-			}
-			l.pos -= trimLength
-			if l.pos > l.start {
-				l.emit(itemText)
-			}
-			l.pos += trimLength
-			l.ignore()
-			return lexLeftDelim
+	l.width = 0
+	if x := strings.Index(l.input[l.pos:], l.leftDelim); x >= 0 {
+		ldn := Pos(len(l.leftDelim))
+		l.pos += Pos(x)
+		trimLength := Pos(0)
+		if strings.HasPrefix(l.input[l.pos+ldn:], leftTrimMarker) {
+			trimLength = rightTrimLength(l.input[l.start:l.pos])
 		}
-		if l.next() == eof {
-			break
+		l.pos -= trimLength
+		if l.pos > l.start {
+			l.emit(itemText)
 		}
+		l.pos += trimLength
+		l.ignore()
+		return lexLeftDelim
+	} else {
+		l.pos = Pos(len(l.input))
 	}
 	// Correctly reached EOF.
 	if l.pos > l.start {
@@ -261,16 +260,6 @@ func lexText(l *lexer) stateFn {
 	}
 	l.emit(itemEOF)
 	return nil
-}
-
-// atLeftDelim reports whether the lexer is at a left delimiter, possibly followed by a trim marker.
-func (l *lexer) atLeftDelim() (delim, trimSpaces bool) {
-	if !strings.HasPrefix(l.input[l.pos:], l.leftDelim) {
-		return false, false
-	}
-	// The left delim might have the marker afterwards.
-	trimSpaces = strings.HasPrefix(l.input[l.pos+Pos(len(l.leftDelim)):], leftTrimMarker)
-	return true, trimSpaces
 }
 
 // rightTrimLength returns the length of the spaces at the end of the string.

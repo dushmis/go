@@ -7,7 +7,7 @@
 //	Portions Copyright © 2004,2006 Bruce Ellis
 //	Portions Copyright © 2005-2007 C H Forsyth (forsyth@terzarima.net)
 //	Revisions Copyright © 2000-2008 Lucent Technologies Inc. and others
-//	Portions Copyright © 2009 The Go Authors.  All rights reserved.
+//	Portions Copyright © 2009 The Go Authors. All rights reserved.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
@@ -110,6 +110,39 @@ const (
 	REG_F30
 	REG_F31
 
+	REG_V0
+	REG_V1
+	REG_V2
+	REG_V3
+	REG_V4
+	REG_V5
+	REG_V6
+	REG_V7
+	REG_V8
+	REG_V9
+	REG_V10
+	REG_V11
+	REG_V12
+	REG_V13
+	REG_V14
+	REG_V15
+	REG_V16
+	REG_V17
+	REG_V18
+	REG_V19
+	REG_V20
+	REG_V21
+	REG_V22
+	REG_V23
+	REG_V24
+	REG_V25
+	REG_V26
+	REG_V27
+	REG_V28
+	REG_V29
+	REG_V30
+	REG_V31
+
 	REG_CR0
 	REG_CR1
 	REG_CR2
@@ -132,29 +165,24 @@ const (
 	REG_LR  = REG_SPR0 + 8
 	REG_CTR = REG_SPR0 + 9
 
-	REGZERO  = REG_R0 /* set to zero */
-	REGSP    = REG_R1
-	REGSB    = REG_R2
-	REGRET   = REG_R3
-	REGARG   = -1      /* -1 disables passing the first argument in register */
-	REGRT1   = REG_R3  /* reserved for runtime, duffzero and duffcopy */
-	REGRT2   = REG_R4  /* reserved for runtime, duffcopy */
-	REGMIN   = REG_R7  /* register variables allocated from here to REGMAX */
-	REGCTXT  = REG_R11 /* context for closures */
-	REGTLS   = REG_R13 /* C ABI TLS base pointer */
-	REGMAX   = REG_R27
-	REGEXT   = REG_R30 /* external registers allocated from here down */
-	REGG     = REG_R30 /* G */
-	REGTMP   = REG_R31 /* used by the linker */
-	FREGRET  = REG_F0
-	FREGMIN  = REG_F17 /* first register variable */
-	FREGMAX  = REG_F26 /* last register variable for 9g only */
-	FREGEXT  = REG_F26 /* first external register */
-	FREGCVI  = REG_F27 /* floating conversion constant */
-	FREGZERO = REG_F28 /* both float and double */
-	FREGHALF = REG_F29 /* double */
-	FREGONE  = REG_F30 /* double */
-	FREGTWO  = REG_F31 /* double */
+	REGZERO = REG_R0 /* set to zero */
+	REGSP   = REG_R1
+	REGSB   = REG_R2
+	REGRET  = REG_R3
+	REGARG  = -1      /* -1 disables passing the first argument in register */
+	REGRT1  = REG_R3  /* reserved for runtime, duffzero and duffcopy */
+	REGRT2  = REG_R4  /* reserved for runtime, duffcopy */
+	REGMIN  = REG_R7  /* register variables allocated from here to REGMAX */
+	REGCTXT = REG_R11 /* context for closures */
+	REGTLS  = REG_R13 /* C ABI TLS base pointer */
+	REGMAX  = REG_R27
+	REGEXT  = REG_R30 /* external registers allocated from here down */
+	REGG    = REG_R30 /* G */
+	REGTMP  = REG_R31 /* used by the linker */
+	FREGRET = REG_F0
+	FREGMIN = REG_F17 /* first register variable */
+	FREGMAX = REG_F26 /* last register variable for 9g only */
+	FREGEXT = REG_F26 /* first external register */
 )
 
 /*
@@ -185,10 +213,57 @@ const (
 	NOSCHED = 1 << 9
 )
 
+// Values for use in branch instruction BC
+// BC B0,BI,label
+// BO is type of branch + likely bits described below
+// BI is CR value + branch type
+// ex: BEQ CR2,label is BC 12,10,label
+//   12 = BO_BCR
+//   10 = BI_CR2 + BI_EQ
+
+const (
+	BI_CR0 = 0
+	BI_CR1 = 4
+	BI_CR2 = 8
+	BI_CR3 = 12
+	BI_CR4 = 16
+	BI_CR5 = 20
+	BI_CR6 = 24
+	BI_CR7 = 28
+	BI_LT  = 0
+	BI_GT  = 1
+	BI_EQ  = 2
+	BI_OVF = 3
+)
+
+// Values for the BO field.  Add the branch type to
+// the likely bits, if a likely setting is known.
+// If branch likely or unlikely is not known, don't set it.
+// e.g. branch on cr+likely = 15
+
+const (
+	BO_BCTR     = 16 // branch on ctr value
+	BO_BCR      = 12 // branch on cr value
+	BO_BCRBCTR  = 8  // branch on ctr and cr value
+	BO_NOTBCR   = 4  // branch on not cr value
+	BO_UNLIKELY = 2  // value for unlikely
+	BO_LIKELY   = 3  // value for likely
+)
+
+// Bit settings from the CR
+
+const (
+	C_COND_LT = iota // 0 result is negative
+	C_COND_GT        // 1 result is positive
+	C_COND_EQ        // 2 result is zero
+	C_COND_SO        // 3 summary overflow or FP compare w/ NaN
+)
+
 const (
 	C_NONE = iota
 	C_REG
 	C_FREG
+	C_VREG
 	C_CREG
 	C_SPR /* special processor register */
 	C_ZCON
@@ -210,8 +285,8 @@ const (
 	C_LAUTO
 	C_SEXT
 	C_LEXT
-	C_ZOREG
-	C_SOREG
+	C_ZOREG // conjecture: either (1) register + zeroed offset, or (2) "R0" implies zero or C_REG
+	C_SOREG // register + signed offset
 	C_LOREG
 	C_FPSCR
 	C_MSR
@@ -257,13 +332,13 @@ const (
 	ABC
 	ABCL
 	ABEQ
-	ABGE
+	ABGE // not LT = G/E/U
 	ABGT
-	ABLE
+	ABLE // not GT = L/E/U
 	ABLT
-	ABNE
-	ABVC
-	ABVS
+	ABNE // not EQ = L/G/U
+	ABVC // Unordered-clear
+	ABVS // Unordered-set
 	ACMP
 	ACMPU
 	ACNTLZW
@@ -315,6 +390,8 @@ const (
 	AFMOVDU
 	AFMOVS
 	AFMOVSU
+	AFMOVSX
+	AFMOVSZ
 	AFMSUB
 	AFMSUBCC
 	AFMSUBS
@@ -341,9 +418,12 @@ const (
 	AFSUBCC
 	AFSUBS
 	AFSUBSCC
+	AISEL
 	AMOVMW
+	ALBAR
 	ALSW
 	ALWAR
+	ALWSYNC
 	AMOVWBR
 	AMOVB
 	AMOVBU
@@ -401,6 +481,7 @@ const (
 	ASRAW
 	ASRAWCC
 	ASRWCC
+	ASTBCCC
 	ASTSW
 	ASTWCCC
 	ASUB
@@ -452,6 +533,12 @@ const (
 	/* optional on 32-bit */
 	AFRES
 	AFRESCC
+	AFRIM
+	AFRIMCC
+	AFRIP
+	AFRIPCC
+	AFRIZ
+	AFRIZCC
 	AFRSQRTE
 	AFRSQRTECC
 	AFSEL
@@ -469,6 +556,10 @@ const (
 	ACMPWU
 	ADIVD
 	ADIVDCC
+	ADIVDE
+	ADIVDECC
+	ADIVDEU
+	ADIVDEUCC
 	ADIVDVCC
 	ADIVDV
 	ADIVDU
@@ -480,6 +571,8 @@ const (
 	/* AFCFIW; AFCFIWCC */
 	AFCFID
 	AFCFIDCC
+	AFCFIDU
+	AFCFIDUCC
 	AFCTID
 	AFCTIDCC
 	AFCTIDZ
@@ -533,6 +626,153 @@ const (
 
 	/* more 64-bit operations */
 	AHRFID
+
+	/* Vector */
+	ALV
+	ALVEBX
+	ALVEHX
+	ALVEWX
+	ALVX
+	ALVXL
+	ALVSL
+	ALVSR
+	ASTV
+	ASTVEBX
+	ASTVEHX
+	ASTVEWX
+	ASTVX
+	ASTVXL
+	AVAND
+	AVANDL
+	AVANDC
+	AVNAND
+	AVOR
+	AVORL
+	AVORC
+	AVNOR
+	AVXOR
+	AVEQV
+	AVADDUM
+	AVADDUBM
+	AVADDUHM
+	AVADDUWM
+	AVADDUDM
+	AVADDUQM
+	AVADDCU
+	AVADDCUQ
+	AVADDCUW
+	AVADDUS
+	AVADDUBS
+	AVADDUHS
+	AVADDUWS
+	AVADDSS
+	AVADDSBS
+	AVADDSHS
+	AVADDSWS
+	AVADDE
+	AVADDEUQM
+	AVADDECUQ
+	AVSUBUM
+	AVSUBUBM
+	AVSUBUHM
+	AVSUBUWM
+	AVSUBUDM
+	AVSUBUQM
+	AVSUBCU
+	AVSUBCUQ
+	AVSUBCUW
+	AVSUBUS
+	AVSUBUBS
+	AVSUBUHS
+	AVSUBUWS
+	AVSUBSS
+	AVSUBSBS
+	AVSUBSHS
+	AVSUBSWS
+	AVSUBE
+	AVSUBEUQM
+	AVSUBECUQ
+	AVR
+	AVRLB
+	AVRLH
+	AVRLW
+	AVRLD
+	AVS
+	AVSLB
+	AVSLH
+	AVSLW
+	AVSL
+	AVSLO
+	AVSRB
+	AVSRH
+	AVSRW
+	AVSR
+	AVSRO
+	AVSLD
+	AVSRD
+	AVSA
+	AVSRAB
+	AVSRAH
+	AVSRAW
+	AVSRAD
+	AVSOI
+	AVSLDOI
+	AVCLZ
+	AVCLZB
+	AVCLZH
+	AVCLZW
+	AVCLZD
+	AVPOPCNT
+	AVPOPCNTB
+	AVPOPCNTH
+	AVPOPCNTW
+	AVPOPCNTD
+	AVCMPEQ
+	AVCMPEQUB
+	AVCMPEQUBCC
+	AVCMPEQUH
+	AVCMPEQUHCC
+	AVCMPEQUW
+	AVCMPEQUWCC
+	AVCMPEQUD
+	AVCMPEQUDCC
+	AVCMPGT
+	AVCMPGTUB
+	AVCMPGTUBCC
+	AVCMPGTUH
+	AVCMPGTUHCC
+	AVCMPGTUW
+	AVCMPGTUWCC
+	AVCMPGTUD
+	AVCMPGTUDCC
+	AVCMPGTSB
+	AVCMPGTSBCC
+	AVCMPGTSH
+	AVCMPGTSHCC
+	AVCMPGTSW
+	AVCMPGTSWCC
+	AVCMPGTSD
+	AVCMPGTSDCC
+	AVPERM
+	AVSEL
+	AVSPLT
+	AVSPLTB
+	AVSPLTH
+	AVSPLTW
+	AVSPLTI
+	AVSPLTISB
+	AVSPLTISH
+	AVSPLTISW
+	AVCIPH
+	AVCIPHER
+	AVCIPHERLAST
+	AVNCIPH
+	AVNCIPHER
+	AVNCIPHERLAST
+	AVSBOX
+	AVSHASIGMA
+	AVSHASIGMAW
+	AVSHASIGMAD
 
 	ALAST
 

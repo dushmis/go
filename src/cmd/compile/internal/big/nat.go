@@ -8,7 +8,10 @@
 
 package big
 
-import "math/rand"
+import (
+	"math/rand"
+	"sync"
+)
 
 // An unsigned integer x of the form
 //
@@ -213,25 +216,25 @@ func (z nat) montgomery(x, y, m nat, k Word, n int) nat {
 	if len(x) != n || len(y) != n || len(m) != n {
 		panic("math/big: mismatched montgomery number lengths")
 	}
-	var c1, c2, c3 Word
 	z = z.make(n)
 	z.clear()
+	var c Word
 	for i := 0; i < n; i++ {
 		d := y[i]
-		c2 = addMulVVW(z, x, d)
+		c2 := addMulVVW(z, x, d)
 		t := z[0] * k
-		c3 = addMulVVW(z, m, t)
+		c3 := addMulVVW(z, m, t)
 		copy(z, z[1:])
-		cx := c1 + c2
+		cx := c + c2
 		cy := cx + c3
 		z[n-1] = cy
 		if cx < c2 || cy < c3 {
-			c1 = 1
+			c = 1
 		} else {
-			c1 = 0
+			c = 0
 		}
 	}
-	if c1 != 0 {
+	if c != 0 {
 		subVV(z, z, m)
 	}
 	return z
@@ -539,6 +542,21 @@ func (z nat) div(z2, u, v nat) (q, r nat) {
 	return
 }
 
+// getNat returns a nat of len n. The contents may not be zero.
+func getNat(n int) nat {
+	var z nat
+	if v := natPool.Get(); v != nil {
+		z = v.(nat)
+	}
+	return z.make(n)
+}
+
+func putNat(x nat) {
+	natPool.Put(x)
+}
+
+var natPool sync.Pool
+
 // q = (uIn-r)/v, with 0 <= r < y
 // Uses z as storage for q, and u as storage for r if possible.
 // See Knuth, Volume 2, section 4.3.1, Algorithm D.
@@ -557,7 +575,7 @@ func (z nat) divLarge(u, uIn, v nat) (q, r nat) {
 	}
 	q = z.make(m + 1)
 
-	qhatv := make(nat, n+1)
+	qhatv := getNat(n + 1)
 	if alias(u, uIn) || alias(u, v) {
 		u = nil // u is an alias for uIn or v - cannot reuse
 	}
@@ -565,10 +583,11 @@ func (z nat) divLarge(u, uIn, v nat) (q, r nat) {
 	u.clear() // TODO(gri) no need to clear if we allocated a new u
 
 	// D1.
+	var v1 nat
 	shift := nlz(v[n-1])
 	if shift > 0 {
 		// do not modify v, it may be used by another goroutine simultaneously
-		v1 := make(nat, n)
+		v1 = getNat(n)
 		shlVU(v1, v, shift)
 		v = v1
 	}
@@ -609,6 +628,10 @@ func (z nat) divLarge(u, uIn, v nat) (q, r nat) {
 
 		q[j] = qhat
 	}
+	if v1 != nil {
+		putNat(v1)
+	}
+	putNat(qhatv)
 
 	q = q.norm()
 	shrVU(u, u, shift)
@@ -647,7 +670,7 @@ func trailingZeroBits(x Word) uint {
 	// x & -x leaves only the right-most bit set in the word. Let k be the
 	// index of that bit. Since only a single bit is set, the value is two
 	// to the power of k. Multiplying by a power of two is equivalent to
-	// left shifting, in this case by k bits.  The de Bruijn constant is
+	// left shifting, in this case by k bits. The de Bruijn constant is
 	// such that all six bit, consecutive substrings are distinct.
 	// Therefore, if we have a left shifted version of this constant we can
 	// find by how many bits it was shifted by looking at which six bit
@@ -1018,7 +1041,7 @@ func (z nat) expNNWindowed(x, y, m nat) nat {
 		for j := 0; j < _W; j += n {
 			if i != len(y)-1 || j != 0 {
 				// Unrolled loop for significant performance
-				// gain.  Use go test -bench=".*" in crypto/rsa
+				// gain. Use go test -bench=".*" in crypto/rsa
 				// to check performance before making changes.
 				zz = zz.mul(z, z)
 				zz, z = z, zz
@@ -1056,23 +1079,19 @@ func (z nat) expNNWindowed(x, y, m nat) nat {
 // expNNMontgomery calculates x**y mod m using a fixed, 4-bit window.
 // Uses Montgomery representation.
 func (z nat) expNNMontgomery(x, y, m nat) nat {
-	var zz, one, rr, RR nat
-
 	numWords := len(m)
 
 	// We want the lengths of x and m to be equal.
+	// It is OK if x >= m as long as len(x) == len(m).
 	if len(x) > numWords {
-		_, rr = rr.div(rr, x, m)
-	} else if len(x) < numWords {
-		rr = rr.make(numWords)
-		rr.clear()
-		for i := range x {
-			rr[i] = x[i]
-		}
-	} else {
-		rr = x
+		_, x = nat(nil).div(nil, x, m)
+		// Note: now len(x) <= numWords, not guaranteed ==.
 	}
-	x = rr
+	if len(x) < numWords {
+		rr := make(nat, numWords)
+		copy(rr, x)
+		x = rr
+	}
 
 	// Ideally the precomputations would be performed outside, and reused
 	// k0 = -m**-1 mod 2**_W. Algorithm from: Dumas, J.G. "On Newton–Raphson
@@ -1086,8 +1105,8 @@ func (z nat) expNNMontgomery(x, y, m nat) nat {
 	k0 = -k0
 
 	// RR = 2**(2*_W*len(m)) mod m
-	RR = RR.setWord(1)
-	zz = zz.shl(RR, uint(2*numWords*_W))
+	RR := nat(nil).setWord(1)
+	zz := nat(nil).shl(RR, uint(2*numWords*_W))
 	_, RR = RR.div(RR, zz, m)
 	if len(RR) < numWords {
 		zz = zz.make(numWords)
@@ -1095,8 +1114,7 @@ func (z nat) expNNMontgomery(x, y, m nat) nat {
 		RR = zz
 	}
 	// one = 1, with equal length to that of m
-	one = one.make(numWords)
-	one.clear()
+	one := make(nat, numWords)
 	one[0] = 1
 
 	const n = 4
@@ -1131,6 +1149,23 @@ func (z nat) expNNMontgomery(x, y, m nat) nat {
 	}
 	// convert to regular number
 	zz = zz.montgomery(z, one, m, k0, numWords)
+
+	// One last reduction, just in case.
+	// See golang.org/issue/13907.
+	if zz.cmp(m) >= 0 {
+		// Common case is m has high bit set; in that case,
+		// since zz is the same length as m, there can be just
+		// one multiple of m to remove. Just subtract.
+		// We think that the subtract should be sufficient in general,
+		// so do that unconditionally, but double-check,
+		// in case our beliefs are wrong.
+		// The div is not expected to be reached.
+		zz = zz.sub(zz, m)
+		if zz.cmp(m) >= 0 {
+			_, zz = nat(nil).div(nil, zz, m)
+		}
+	}
+
 	return zz.norm()
 }
 

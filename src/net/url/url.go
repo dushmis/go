@@ -3,8 +3,12 @@
 // license that can be found in the LICENSE file.
 
 // Package url parses URLs and implements query escaping.
-// See RFC 3986.
 package url
+
+// See RFC 3986. This package generally follows RFC 3986, except where
+// it deviates for compatibility reasons. When sending changes, first
+// search old issues for history on decisions. Unit tests should also
+// contain references to issue numbers with details.
 
 import (
 	"bytes"
@@ -193,8 +197,9 @@ func unescape(s string, mode encoding) (string, error) {
 				// that are valid host name bytes in their unescaped form.
 				// That is, you can use escaping in the zone identifier but not
 				// to introduce bytes you couldn't just write directly.
+				// But Windows puts spaces here! Yay.
 				v := unhex(s[i+1])<<4 | unhex(s[i+2])
-				if s[i:i+3] != "%25" && shouldEscape(v, encodeHost) {
+				if s[i:i+3] != "%25" && v != ' ' && shouldEscape(v, encodeHost) {
 					return "", EscapeError(s[i : i+3])
 				}
 			}
@@ -306,14 +311,15 @@ func escape(s string, mode encoding) string {
 // construct a URL struct directly and set the Opaque field instead of Path.
 // These still work as well.
 type URL struct {
-	Scheme   string
-	Opaque   string    // encoded opaque data
-	User     *Userinfo // username and password information
-	Host     string    // host or host:port
-	Path     string
-	RawPath  string // encoded path hint (Go 1.5 and later only; see EscapedPath method)
-	RawQuery string // encoded query values, without '?'
-	Fragment string // fragment for references, without '#'
+	Scheme     string
+	Opaque     string    // encoded opaque data
+	User       *Userinfo // username and password information
+	Host       string    // host or host:port
+	Path       string
+	RawPath    string // encoded path hint (Go 1.5 and later only; see EscapedPath method)
+	ForceQuery bool   // append a query ('?') even if RawQuery is empty
+	RawQuery   string // encoded query values, without '?'
+	Fragment   string // fragment for references, without '#'
 }
 
 // User returns a Userinfo containing the provided username
@@ -350,10 +356,7 @@ func (u *Userinfo) Username() string {
 
 // Password returns the password in case it is set, and whether it is set.
 func (u *Userinfo) Password() (string, bool) {
-	if u.passwordSet {
-		return u.password, true
-	}
-	return "", false
+	return u.password, u.passwordSet
 }
 
 // String returns the encoded userinfo information in the standard form
@@ -409,11 +412,12 @@ func split(s string, c string, cutc bool) (string, string) {
 
 // Parse parses rawurl into a URL structure.
 // The rawurl may be relative or absolute.
-func Parse(rawurl string) (url *URL, err error) {
+func Parse(rawurl string) (*URL, error) {
 	// Cut off #frag
 	u, frag := split(rawurl, "#", true)
-	if url, err = parse(u, false); err != nil {
-		return nil, err
+	url, err := parse(u, false)
+	if err != nil {
+		return nil, &Error{"parse", u, err}
 	}
 	if frag == "" {
 		return url, nil
@@ -424,41 +428,50 @@ func Parse(rawurl string) (url *URL, err error) {
 	return url, nil
 }
 
-// ParseRequestURI parses rawurl into a URL structure.  It assumes that
+// ParseRequestURI parses rawurl into a URL structure. It assumes that
 // rawurl was received in an HTTP request, so the rawurl is interpreted
 // only as an absolute URI or an absolute path.
 // The string rawurl is assumed not to have a #fragment suffix.
 // (Web browsers strip #fragment before sending the URL to a web server.)
-func ParseRequestURI(rawurl string) (url *URL, err error) {
-	return parse(rawurl, true)
+func ParseRequestURI(rawurl string) (*URL, error) {
+	url, err := parse(rawurl, true)
+	if err != nil {
+		return nil, &Error{"parse", rawurl, err}
+	}
+	return url, nil
 }
 
-// parse parses a URL from a string in one of two contexts.  If
+// parse parses a URL from a string in one of two contexts. If
 // viaRequest is true, the URL is assumed to have arrived via an HTTP request,
 // in which case only absolute URLs or path-absolute relative URLs are allowed.
 // If viaRequest is false, all forms of relative URLs are allowed.
-func parse(rawurl string, viaRequest bool) (url *URL, err error) {
+func parse(rawurl string, viaRequest bool) (*URL, error) {
 	var rest string
+	var err error
 
 	if rawurl == "" && viaRequest {
-		err = errors.New("empty url")
-		goto Error
+		return nil, errors.New("empty url")
 	}
-	url = new(URL)
+	url := new(URL)
 
 	if rawurl == "*" {
 		url.Path = "*"
-		return
+		return url, nil
 	}
 
 	// Split off possible leading "http:", "mailto:", etc.
 	// Cannot contain escaped characters.
 	if url.Scheme, rest, err = getscheme(rawurl); err != nil {
-		goto Error
+		return nil, err
 	}
 	url.Scheme = strings.ToLower(url.Scheme)
 
-	rest, url.RawQuery = split(rest, "?", true)
+	if strings.HasSuffix(rest, "?") && strings.Count(rest, "?") == 1 {
+		url.ForceQuery = true
+		rest = rest[:len(rest)-1]
+	} else {
+		rest, url.RawQuery = split(rest, "?", true)
+	}
 
 	if !strings.HasPrefix(rest, "/") {
 		if url.Scheme != "" {
@@ -467,8 +480,7 @@ func parse(rawurl string, viaRequest bool) (url *URL, err error) {
 			return url, nil
 		}
 		if viaRequest {
-			err = errors.New("invalid URI for request")
-			goto Error
+			return nil, errors.New("invalid URI for request")
 		}
 	}
 
@@ -477,23 +489,17 @@ func parse(rawurl string, viaRequest bool) (url *URL, err error) {
 		authority, rest = split(rest[2:], "/", false)
 		url.User, url.Host, err = parseAuthority(authority)
 		if err != nil {
-			goto Error
+			return nil, err
 		}
 	}
-	if url.Path, err = unescape(rest, encodePath); err != nil {
-		goto Error
-	}
-	// RawPath is a hint as to the encoding of Path to use
-	// in url.EscapedPath. If that method already gets the
-	// right answer without RawPath, leave it empty.
-	// This will help make sure that people don't rely on it in general.
-	if url.EscapedPath() != rest && validEncodedPath(rest) {
-		url.RawPath = rest
+	// Set Path and, optionally, RawPath.
+	// RawPath is a hint of the encoding of Path. We don't want to set it if
+	// the default escaping of Path is equivalent, to help make sure that people
+	// don't rely on it in general.
+	if err := url.setPath(rest); err != nil {
+		return nil, err
 	}
 	return url, nil
-
-Error:
-	return nil, &Error{"parse", rawurl, err}
 }
 
 func parseAuthority(authority string) (user *Userinfo, host string, err error) {
@@ -510,7 +516,7 @@ func parseAuthority(authority string) (user *Userinfo, host string, err error) {
 		return nil, host, nil
 	}
 	userinfo := authority[:i]
-	if strings.Index(userinfo, ":") < 0 {
+	if !strings.Contains(userinfo, ":") {
 		if userinfo, err = unescape(userinfo, encodeUserPassword); err != nil {
 			return nil, "", err
 		}
@@ -572,6 +578,29 @@ func parseHost(host string) (string, error) {
 		return "", err
 	}
 	return host, nil
+}
+
+// setPath sets the Path and RawPath fields of the URL based on the provided
+// escaped path p. It maintains the invariant that RawPath is only specified
+// when it differs from the default encoding of the path.
+// For example:
+// - setPath("/foo/bar")   will set Path="/foo/bar" and RawPath=""
+// - setPath("/foo%2fbar") will set Path="/foo/bar" and RawPath="/foo%2fbar"
+// setPath will return an error only if the provided path contains an invalid
+// escaping.
+func (u *URL) setPath(p string) error {
+	path, err := unescape(p, encodePath)
+	if err != nil {
+		return err
+	}
+	u.Path = path
+	if escp := escape(path, encodePath); p == escp {
+		// Default encoding is fine.
+		u.RawPath = ""
+	} else {
+		u.RawPath = p
+	}
+	return nil
 }
 
 // EscapedPath returns the escaped form of u.Path.
@@ -681,9 +710,20 @@ func (u *URL) String() string {
 		if path != "" && path[0] != '/' && u.Host != "" {
 			buf.WriteByte('/')
 		}
+		if buf.Len() == 0 {
+			// RFC 3986 §4.2
+			// A path segment that contains a colon character (e.g., "this:that")
+			// cannot be used as the first segment of a relative-path reference, as
+			// it would be mistaken for a scheme name. Such a segment must be
+			// preceded by a dot-segment (e.g., "./this:that") to make a relative-
+			// path reference.
+			if i := strings.IndexByte(path, ':'); i > -1 && strings.IndexByte(path[:i], '/') == -1 {
+				buf.WriteString("./")
+			}
+		}
 		buf.WriteString(path)
 	}
-	if u.RawQuery != "" {
+	if u.ForceQuery || u.RawQuery != "" {
 		buf.WriteByte('?')
 		buf.WriteString(u.RawQuery)
 	}
@@ -708,8 +748,8 @@ func (v Values) Get(key string) string {
 	if v == nil {
 		return ""
 	}
-	vs, ok := v[key]
-	if !ok || len(vs) == 0 {
+	vs := v[key]
+	if len(vs) == 0 {
 		return ""
 	}
 	return vs[0]
@@ -737,10 +777,10 @@ func (v Values) Del(key string) {
 // ParseQuery always returns a non-nil map containing all the
 // valid query parameters found; err describes the first decoding error
 // encountered, if any.
-func ParseQuery(query string) (m Values, err error) {
-	m = make(Values)
-	err = parseQuery(m, query)
-	return
+func ParseQuery(query string) (Values, error) {
+	m := make(Values)
+	err := parseQuery(m, query)
+	return m, err
 }
 
 func parseQuery(m Values, query string) (err error) {
@@ -840,12 +880,13 @@ func resolvePath(base, ref string) string {
 }
 
 // IsAbs reports whether the URL is absolute.
+// Absolute means that it has a non-empty scheme.
 func (u *URL) IsAbs() bool {
 	return u.Scheme != ""
 }
 
-// Parse parses a URL in the context of the receiver.  The provided URL
-// may be relative or absolute.  Parse returns nil, err on parse
+// Parse parses a URL in the context of the receiver. The provided URL
+// may be relative or absolute. Parse returns nil, err on parse
 // failure, otherwise its return value is the same as ResolveReference.
 func (u *URL) Parse(ref string) (*URL, error) {
 	refurl, err := Parse(ref)
@@ -857,7 +898,7 @@ func (u *URL) Parse(ref string) (*URL, error) {
 
 // ResolveReference resolves a URI reference to an absolute URI from
 // an absolute base URI, per RFC 3986 Section 5.2.  The URI reference
-// may be relative or absolute.  ResolveReference always returns a new
+// may be relative or absolute. ResolveReference always returns a new
 // URL instance, even if the returned URL is identical to either the
 // base or reference. If ref is an absolute URL, then ResolveReference
 // ignores base and returns a copy of ref.
@@ -868,7 +909,9 @@ func (u *URL) ResolveReference(ref *URL) *URL {
 	}
 	if ref.Scheme != "" || ref.Host != "" || ref.User != nil {
 		// The "absoluteURI" or "net_path" cases.
-		url.Path = resolvePath(ref.Path, "")
+		// We can ignore the error from setPath since we know we provided a
+		// validly-escaped path.
+		url.setPath(resolvePath(ref.EscapedPath(), ""))
 		return &url
 	}
 	if ref.Opaque != "" {
@@ -888,7 +931,7 @@ func (u *URL) ResolveReference(ref *URL) *URL {
 	// The "abs_path" or "rel_path" cases.
 	url.Host = u.Host
 	url.User = u.User
-	url.Path = resolvePath(u.Path, ref.Path)
+	url.setPath(resolvePath(u.EscapedPath(), ref.EscapedPath()))
 	return &url
 }
 
@@ -912,8 +955,48 @@ func (u *URL) RequestURI() string {
 			result = u.Scheme + ":" + result
 		}
 	}
-	if u.RawQuery != "" {
+	if u.ForceQuery || u.RawQuery != "" {
 		result += "?" + u.RawQuery
 	}
 	return result
+}
+
+// Hostname returns u.Host, without any port number.
+//
+// If Host is an IPv6 literal with a port number, Hostname returns the
+// IPv6 literal without the square brackets. IPv6 literals may include
+// a zone identifier.
+func (u *URL) Hostname() string {
+	return stripPort(u.Host)
+}
+
+// Port returns the port part of u.Host, without the leading colon.
+// If u.Host doesn't contain a port, Port returns an empty string.
+func (u *URL) Port() string {
+	return portOnly(u.Host)
+}
+
+func stripPort(hostport string) string {
+	colon := strings.IndexByte(hostport, ':')
+	if colon == -1 {
+		return hostport
+	}
+	if i := strings.IndexByte(hostport, ']'); i != -1 {
+		return strings.TrimPrefix(hostport[:i], "[")
+	}
+	return hostport[:colon]
+}
+
+func portOnly(hostport string) string {
+	colon := strings.IndexByte(hostport, ':')
+	if colon == -1 {
+		return ""
+	}
+	if i := strings.Index(hostport, "]:"); i != -1 {
+		return hostport[i+len("]:"):]
+	}
+	if strings.Contains(hostport, "]") {
+		return ""
+	}
+	return hostport[colon+len(":"):]
 }

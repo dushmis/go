@@ -1,4 +1,4 @@
-// Copyright 2015 The Go Authors.  All rights reserved.
+// Copyright 2015 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
@@ -87,6 +87,17 @@ import (
 // frames that have potentially been active since the concurrent scan,
 // so it depends on write barriers to track changes to pointers in
 // stack frames that have not been active.
+//
+//
+// Global writes:
+//
+// The Go garbage collector requires write barriers when heap pointers
+// are stored in globals. Many garbage collectors ignore writes to
+// globals and instead pick up global -> heap pointers during
+// termination. This increases pause time, so we instead rely on write
+// barriers for writes to globals so that we don't have to rescan
+// global during mark termination.
+//
 //go:nowritebarrierrec
 func gcmarkwb_m(slot *uintptr, ptr uintptr) {
 	if writeBarrier.needed {
@@ -100,7 +111,7 @@ func gcmarkwb_m(slot *uintptr, ptr uintptr) {
 // related operations. In particular there are times when the GC assumes
 // that the world is stopped but scheduler related code is still being
 // executed, dealing with syscalls, dealing with putting gs on runnable
-// queues and so forth. This code can not execute write barriers because
+// queues and so forth. This code cannot execute write barriers because
 // the GC might drop them on the floor. Stopping the world involves removing
 // the p associated with an m. We use the fact that m.p == nil to indicate
 // that we are in one these critical section and throw if the write is of
@@ -134,7 +145,7 @@ func writebarrierptr(dst *uintptr, src uintptr) {
 	if !writeBarrier.needed {
 		return
 	}
-	if src != 0 && (src < sys.PhysPageSize || src == poisonStack) {
+	if src != 0 && src < minPhysPageSize {
 		systemstack(func() {
 			print("runtime: writebarrierptr *", dst, " = ", hex(src), "\n")
 			throw("bad pointer in write barrier")
@@ -153,36 +164,11 @@ func writebarrierptr_nostore(dst *uintptr, src uintptr) {
 	if !writeBarrier.needed {
 		return
 	}
-	if src != 0 && (src < sys.PhysPageSize || src == poisonStack) {
+	if src != 0 && src < minPhysPageSize {
 		systemstack(func() { throw("bad pointer in write barrier") })
 	}
 	writebarrierptr_nostore1(dst, src)
 }
-
-//go:nosplit
-func writebarrierstring(dst *[2]uintptr, src [2]uintptr) {
-	writebarrierptr(&dst[0], src[0])
-	dst[1] = src[1]
-}
-
-//go:nosplit
-func writebarrierslice(dst *[3]uintptr, src [3]uintptr) {
-	writebarrierptr(&dst[0], src[0])
-	dst[1] = src[1]
-	dst[2] = src[2]
-}
-
-//go:nosplit
-func writebarrieriface(dst *[2]uintptr, src [2]uintptr) {
-	writebarrierptr(&dst[0], src[0])
-	writebarrierptr(&dst[1], src[1])
-}
-
-//go:generate go run wbfat_gen.go -- wbfat.go
-//
-// The above line generates multiword write barriers for
-// all the combinations of ptr+scalar up to four words.
-// The implementations are written to wbfat.go.
 
 // typedmemmove copies a value of type t to dst from src.
 //go:nosplit
@@ -199,6 +185,14 @@ func typedmemmove(typ *_type, dst, src unsafe.Pointer) {
 
 //go:linkname reflect_typedmemmove reflect.typedmemmove
 func reflect_typedmemmove(typ *_type, dst, src unsafe.Pointer) {
+	if raceenabled {
+		raceWriteObjectPC(typ, dst, getcallerpc(unsafe.Pointer(&typ)), funcPC(reflect_typedmemmove))
+		raceReadObjectPC(typ, src, getcallerpc(unsafe.Pointer(&typ)), funcPC(reflect_typedmemmove))
+	}
+	if msanenabled {
+		msanwrite(dst, typ.size)
+		msanread(src, typ.size)
+	}
 	typedmemmove(typ, dst, src)
 }
 
@@ -210,7 +204,7 @@ func reflect_typedmemmovepartial(typ *_type, dst, src unsafe.Pointer, off, size 
 	if writeBarrier.cgo {
 		cgoCheckMemmove(typ, dst, src, off, size)
 	}
-	if !writeBarrier.needed || typ.kind&kindNoPointers != 0 || size < sys.PtrSize || !inheap(uintptr(dst)) {
+	if !writeBarrier.needed || typ.kind&kindNoPointers != 0 || size < sys.PtrSize {
 		return
 	}
 
@@ -226,11 +220,11 @@ func reflect_typedmemmovepartial(typ *_type, dst, src unsafe.Pointer, off, size 
 // values have just been copied to frame, starting at retoffset
 // and continuing to framesize. The entire frame (not just the return
 // values) is described by typ. Because the copy has already
-// happened, we call writebarrierptr_nostore, and we must be careful
-// not to be preempted before the write barriers have been run.
+// happened, we call writebarrierptr_nostore, and this is nosplit so
+// the copy and write barrier appear atomic to GC.
 //go:nosplit
 func callwritebarrier(typ *_type, frame unsafe.Pointer, framesize, retoffset uintptr) {
-	if !writeBarrier.needed || typ == nil || typ.kind&kindNoPointers != 0 || framesize-retoffset < sys.PtrSize || !inheap(uintptr(frame)) {
+	if !writeBarrier.needed || typ == nil || typ.kind&kindNoPointers != 0 || framesize-retoffset < sys.PtrSize {
 		return
 	}
 	heapBitsBulkBarrier(uintptr(add(frame, retoffset)), framesize-retoffset)
@@ -247,8 +241,8 @@ func typedslicecopy(typ *_type, dst, src slice) int {
 	if n == 0 {
 		return 0
 	}
-	dstp := unsafe.Pointer(dst.array)
-	srcp := unsafe.Pointer(src.array)
+	dstp := dst.array
+	srcp := src.array
 
 	if raceenabled {
 		callerpc := getcallerpc(unsafe.Pointer(&typ))
@@ -304,7 +298,7 @@ func typedslicecopy(typ *_type, dst, src slice) int {
 			}
 		}
 	})
-	return int(n)
+	return n
 }
 
 //go:linkname reflect_typedslicecopy reflect.typedslicecopy
@@ -314,7 +308,23 @@ func reflect_typedslicecopy(elemType *_type, dst, src slice) int {
 		if n > src.len {
 			n = src.len
 		}
-		memmove(dst.array, src.array, uintptr(n)*elemType.size)
+		if n == 0 {
+			return 0
+		}
+
+		size := uintptr(n) * elemType.size
+		if raceenabled {
+			callerpc := getcallerpc(unsafe.Pointer(&elemType))
+			pc := funcPC(reflect_typedslicecopy)
+			racewriterangepc(dst.array, size, callerpc, pc)
+			racereadrangepc(src.array, size, callerpc, pc)
+		}
+		if msanenabled {
+			msanwrite(dst.array, size)
+			msanread(src.array, size)
+		}
+
+		memmove(dst.array, src.array, size)
 		return n
 	}
 	return typedslicecopy(elemType, dst, src)

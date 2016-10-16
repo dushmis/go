@@ -440,6 +440,8 @@ var parseErrorTests = []ParseErrorTest{
 	{RFC3339, "2006-01-02T15:04_abc", `parsing time "2006-01-02T15:04_abc" as "2006-01-02T15:04:05Z07:00": cannot parse "_abc" as ":"`},
 	{RFC3339, "2006-01-02T15:04:05_abc", `parsing time "2006-01-02T15:04:05_abc" as "2006-01-02T15:04:05Z07:00": cannot parse "_abc" as "Z07:00"`},
 	{RFC3339, "2006-01-02T15:04:05Z_abc", `parsing time "2006-01-02T15:04:05Z_abc": extra text: _abc`},
+	// invalid second followed by optional fractional seconds
+	{RFC3339, "2010-02-04T21:00:67.012345678-08:00", "second out of range"},
 }
 
 func TestParseErrors(t *testing.T) {
@@ -447,7 +449,7 @@ func TestParseErrors(t *testing.T) {
 		_, err := Parse(test.format, test.value)
 		if err == nil {
 			t.Errorf("expected error for %q %q", test.format, test.value)
-		} else if strings.Index(err.Error(), test.expect) < 0 {
+		} else if !strings.Contains(err.Error(), test.expect) {
 			t.Errorf("expected error with %q for %q %q; got %s", test.expect, test.format, test.value, err)
 		}
 	}

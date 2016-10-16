@@ -22,7 +22,7 @@ import (
 // the subsequent tests fail.
 func TestZoneData(t *testing.T) {
 	lt := Now()
-	// PST is 8 hours west, PDT is 7 hours west.  We could use the name but it's not unique.
+	// PST is 8 hours west, PDT is 7 hours west. We could use the name but it's not unique.
 	if name, off := lt.Zone(); off != -8*60*60 && off != -7*60*60 {
 		t.Errorf("Unable to find US Pacific time zone data for testing; time zone is %q offset %d", name, off)
 		t.Error("Likely problem: the time zone files have not been installed.")
@@ -533,7 +533,7 @@ var durationTests = []struct {
 	str string
 	d   Duration
 }{
-	{"0", 0},
+	{"0s", 0},
 	{"1ns", 1 * Nanosecond},
 	{"1.1µs", 1100 * Nanosecond},
 	{"2.2ms", 2200 * Microsecond},
@@ -840,6 +840,10 @@ var parseDurationTests = []struct {
 	{"9223372036s854ms775us807ns", true, (1<<63 - 1) * Nanosecond},
 	// large negative value
 	{"-9223372036854775807ns", true, -1<<63 + 1*Nanosecond},
+	// huge string; issue 15011.
+	{"0.100000000000000000000h", true, 6 * Minute},
+	// This value tests the first overflow check in leadingFraction.
+	{"0.830103483285477580700h", true, 49*Minute + 48*Second + 372539827*Nanosecond},
 
 	// errors
 	{"", false, 0},
@@ -891,7 +895,7 @@ func TestLocationRace(t *testing.T) {
 	go func() {
 		c <- Now().String()
 	}()
-	Now().String()
+	_ = Now().String()
 	<-c
 	Sleep(100 * Millisecond)
 
@@ -939,8 +943,11 @@ func TestLoadFixed(t *testing.T) {
 	// but Go and most other systems use "east is positive".
 	// So GMT+1 corresponds to -3600 in the Go zone, not +3600.
 	name, offset := Now().In(loc).Zone()
-	if name != "GMT+1" || offset != -1*60*60 {
-		t.Errorf("Now().In(loc).Zone() = %q, %d, want %q, %d", name, offset, "GMT+1", -1*60*60)
+	// The zone abbreviation is "-01" since tzdata-2016g, and "GMT+1"
+	// on earlier versions; we accept both. (Issue #17276).
+	if !(name == "GMT+1" || name == "-01") || offset != -1*60*60 {
+		t.Errorf("Now().In(loc).Zone() = %q, %d, want %q or %q, %d",
+			name, offset, "GMT+1", "-01", -1*60*60)
 	}
 }
 
@@ -1028,6 +1035,98 @@ func TestDurationHours(t *testing.T) {
 	for _, tt := range hourDurationTests {
 		if got := tt.d.Hours(); got != tt.want {
 			t.Errorf("d.Hours() = %g; want: %g", got, tt.want)
+		}
+	}
+}
+
+var defaultLocTests = []struct {
+	name string
+	f    func(t1, t2 Time) bool
+}{
+	{"After", func(t1, t2 Time) bool { return t1.After(t2) == t2.After(t1) }},
+	{"Before", func(t1, t2 Time) bool { return t1.Before(t2) == t2.Before(t1) }},
+	{"Equal", func(t1, t2 Time) bool { return t1.Equal(t2) == t2.Equal(t1) }},
+
+	{"IsZero", func(t1, t2 Time) bool { return t1.IsZero() == t2.IsZero() }},
+	{"Date", func(t1, t2 Time) bool {
+		a1, b1, c1 := t1.Date()
+		a2, b2, c2 := t2.Date()
+		return a1 == a2 && b1 == b2 && c1 == c2
+	}},
+	{"Year", func(t1, t2 Time) bool { return t1.Year() == t2.Year() }},
+	{"Month", func(t1, t2 Time) bool { return t1.Month() == t2.Month() }},
+	{"Day", func(t1, t2 Time) bool { return t1.Day() == t2.Day() }},
+	{"Weekday", func(t1, t2 Time) bool { return t1.Weekday() == t2.Weekday() }},
+	{"ISOWeek", func(t1, t2 Time) bool {
+		a1, b1 := t1.ISOWeek()
+		a2, b2 := t2.ISOWeek()
+		return a1 == a2 && b1 == b2
+	}},
+	{"Clock", func(t1, t2 Time) bool {
+		a1, b1, c1 := t1.Clock()
+		a2, b2, c2 := t2.Clock()
+		return a1 == a2 && b1 == b2 && c1 == c2
+	}},
+	{"Hour", func(t1, t2 Time) bool { return t1.Hour() == t2.Hour() }},
+	{"Minute", func(t1, t2 Time) bool { return t1.Minute() == t2.Minute() }},
+	{"Second", func(t1, t2 Time) bool { return t1.Second() == t2.Second() }},
+	{"Nanosecond", func(t1, t2 Time) bool { return t1.Hour() == t2.Hour() }},
+	{"YearDay", func(t1, t2 Time) bool { return t1.YearDay() == t2.YearDay() }},
+
+	// Using Equal since Add don't modify loc using "==" will cause a fail
+	{"Add", func(t1, t2 Time) bool { return t1.Add(Hour).Equal(t2.Add(Hour)) }},
+	{"Sub", func(t1, t2 Time) bool { return t1.Sub(t2) == t2.Sub(t1) }},
+
+	//Original caus for this test case bug 15852
+	{"AddDate", func(t1, t2 Time) bool { return t1.AddDate(1991, 9, 3) == t2.AddDate(1991, 9, 3) }},
+
+	{"UTC", func(t1, t2 Time) bool { return t1.UTC() == t2.UTC() }},
+	{"Local", func(t1, t2 Time) bool { return t1.Local() == t2.Local() }},
+	{"In", func(t1, t2 Time) bool { return t1.In(UTC) == t2.In(UTC) }},
+
+	{"Local", func(t1, t2 Time) bool { return t1.Local() == t2.Local() }},
+	{"Zone", func(t1, t2 Time) bool {
+		a1, b1 := t1.Zone()
+		a2, b2 := t2.Zone()
+		return a1 == a2 && b1 == b2
+	}},
+
+	{"Unix", func(t1, t2 Time) bool { return t1.Unix() == t2.Unix() }},
+	{"UnixNano", func(t1, t2 Time) bool { return t1.UnixNano() == t2.UnixNano() }},
+
+	{"MarshalBinary", func(t1, t2 Time) bool {
+		a1, b1 := t1.MarshalBinary()
+		a2, b2 := t2.MarshalBinary()
+		return bytes.Equal(a1, a2) && b1 == b2
+	}},
+	{"GobEncode", func(t1, t2 Time) bool {
+		a1, b1 := t1.GobEncode()
+		a2, b2 := t2.GobEncode()
+		return bytes.Equal(a1, a2) && b1 == b2
+	}},
+	{"MarshalJSON", func(t1, t2 Time) bool {
+		a1, b1 := t1.MarshalJSON()
+		a2, b2 := t2.MarshalJSON()
+		return bytes.Equal(a1, a2) && b1 == b2
+	}},
+	{"MarshalText", func(t1, t2 Time) bool {
+		a1, b1 := t1.MarshalText()
+		a2, b2 := t2.MarshalText()
+		return bytes.Equal(a1, a2) && b1 == b2
+	}},
+
+	{"Truncate", func(t1, t2 Time) bool { return t1.Truncate(Hour).Equal(t2.Truncate(Hour)) }},
+	{"Round", func(t1, t2 Time) bool { return t1.Round(Hour).Equal(t2.Round(Hour)) }},
+}
+
+func TestDefaultLoc(t *testing.T) {
+	//This test verifyes that all Time's methods behaves identical if loc is set
+	//as nil or UTC
+	for _, tt := range defaultLocTests {
+		t1 := Time{}
+		t2 := Time{}.UTC()
+		if !tt.f(t1, t2) {
+			t.Errorf("Default fail on fuction: %s", tt.name)
 		}
 	}
 }

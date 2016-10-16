@@ -100,7 +100,9 @@ func testTestDir(t *testing.T, path string, ignore ...string) {
 			switch cmd {
 			case "skip", "compiledir":
 				continue // ignore this file
-			case "errorcheck":
+			// TODO(mdempsky): Remove -newparser=0 case once
+			// test/fixedbugs/issue11610.go is updated.
+			case "errorcheck", "errorcheck -newparser=0":
 				expectErrors = true
 			}
 		}
@@ -155,6 +157,8 @@ func TestStdFixed(t *testing.T) {
 		"issue6889.go",  // gc-specific test
 		"issue7746.go",  // large constants - consumes too much memory
 		"issue11362.go", // canonical import path check
+		"issue15002.go", // uses Mmap; testTestDir should consult build tags
+		"issue16369.go", // go/types handles this correctly - not an issue
 	)
 }
 
@@ -266,13 +270,16 @@ func walkDirs(t *testing.T, dir string) {
 	}
 
 	// typecheck package in directory
-	files, err := pkgFilenames(dir)
-	if err != nil {
-		t.Error(err)
-		return
-	}
-	if files != nil {
-		typecheck(t, dir, files)
+	// but ignore files directly under $GOROOT/src (might be temporary test files).
+	if dir != filepath.Join(runtime.GOROOT(), "src") {
+		files, err := pkgFilenames(dir)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		if files != nil {
+			typecheck(t, dir, files)
+		}
 	}
 
 	// traverse subdirectories, but don't walk into testdata

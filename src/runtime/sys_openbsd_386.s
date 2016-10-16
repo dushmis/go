@@ -187,7 +187,7 @@ TEXT runtime·sigaction(SB),NOSPLIT,$-4
 	MOVL	$0xf1, 0xf1		// crash
 	RET
 
-TEXT runtime·sigprocmask(SB),NOSPLIT,$-4
+TEXT runtime·obsdsigprocmask(SB),NOSPLIT,$-4
 	MOVL	$48, AX			// sys_sigprocmask
 	INT	$0x80
 	JAE	2(PC)
@@ -214,14 +214,6 @@ TEXT runtime·sigtramp(SB),NOSPLIT,$12
 	MOVL	context+8(FP), BX
 	MOVL	BX, 8(SP)
 	CALL	runtime·sigtrampgo(SB)
-
-	// call sigreturn
-	MOVL	context+8(FP), AX
-	MOVL	$0, 0(SP)		// syscall gap
-	MOVL	AX, 4(SP)		// arg 1 - sigcontext
-	MOVL	$103, AX		// sys_sigreturn
-	INT	$0x80
-	MOVL	$0xf1, 0xf1		// crash
 	RET
 
 // int32 tfork(void *param, uintptr psize, M *mp, G *gp, void (*fn)(void));
@@ -279,7 +271,7 @@ TEXT runtime·tfork(SB),NOSPLIT,$12
 	POPL	AX
 	POPAL
 	
-	// Now segment is established.  Initialize m, g.
+	// Now segment is established. Initialize m, g.
 	get_tls(AX)
 	MOVL	DX, g(AX)
 	MOVL	BX, g_m(DX)
@@ -302,8 +294,8 @@ TEXT runtime·tfork(SB),NOSPLIT,$12
 
 TEXT runtime·sigaltstack(SB),NOSPLIT,$-8
 	MOVL	$288, AX		// sys_sigaltstack
-	MOVL	new+4(SP), BX
-	MOVL	old+8(SP), CX
+	MOVL	new+0(FP), BX
+	MOVL	old+4(FP), CX
 	INT	$0x80
 	CMPL	AX, $0xfffff001
 	JLS	2(PC)

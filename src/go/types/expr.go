@@ -184,7 +184,8 @@ func roundFloat64(x constant.Value) constant.Value {
 // provided (only needed for int/uint sizes).
 //
 // If rounded != nil, *rounded is set to the rounded value of x for
-// representable floating-point values; it is left alone otherwise.
+// representable floating-point and complex values, and to an Int
+// value for integer values; it is left alone otherwise.
 // It is ok to provide the addressof the first argument for rounded.
 func representableConst(x constant.Value, conf *Config, typ *Basic, rounded *constant.Value) bool {
 	if x.Kind() == constant.Unknown {
@@ -196,6 +197,9 @@ func representableConst(x constant.Value, conf *Config, typ *Basic, rounded *con
 		x := constant.ToInt(x)
 		if x.Kind() != constant.Int {
 			return false
+		}
+		if rounded != nil {
+			*rounded = x
 		}
 		if x, ok := constant.Int64Val(x); ok {
 			switch typ.kind {
@@ -537,7 +541,7 @@ func (check *Checker) convertUntyped(x *operand, target Type) {
 			if !t.Empty() {
 				goto Error
 			}
-			target = defaultType(x.typ)
+			target = Default(x.typ)
 		}
 	case *Pointer, *Signature, *Slice, *Map, *Chan:
 		if !x.isNil() {
@@ -601,8 +605,8 @@ func (check *Checker) comparison(x, y *operand, op token.Token) {
 		// time will be materialized. Update the expression trees.
 		// If the current types are untyped, the materialized type
 		// is the respective default type.
-		check.updateExprType(x.expr, defaultType(x.typ), true)
-		check.updateExprType(y.expr, defaultType(y.typ), true)
+		check.updateExprType(x.expr, Default(x.typ), true)
+		check.updateExprType(y.expr, Default(y.typ), true)
 	}
 
 	// spec: "Comparison operators compare two operands and yield
@@ -656,10 +660,10 @@ func (check *Checker) shift(x, y *operand, e *ast.BinaryExpr, op token.Token) {
 				return
 			}
 			// rhs must be within reasonable bounds
-			const stupidShift = 1023 - 1 + 52 // so we can express smallestFloat64
+			const shiftBound = 1023 - 1 + 52 // so we can express smallestFloat64
 			s, ok := constant.Uint64Val(yval)
-			if !ok || s > stupidShift {
-				check.invalidOp(y.pos(), "stupid shift count %s", y)
+			if !ok || s > shiftBound {
+				check.invalidOp(y.pos(), "invalid shift count %s", y)
 				x.mode = invalid
 				return
 			}
@@ -808,8 +812,6 @@ func (check *Checker) binary(x *operand, e *ast.BinaryExpr, lhs, rhs ast.Expr, o
 		typ := x.typ.Underlying().(*Basic)
 		// force integer division of integer operands
 		if op == token.QUO && isInteger(typ) {
-			xval = constant.ToInt(xval)
-			yval = constant.ToInt(yval)
 			op = token.QUO_ASSIGN
 		}
 		x.val = constant.BinaryOp(xval, op, yval)
@@ -1104,9 +1106,12 @@ func (check *Checker) exprInternal(x *operand, e ast.Expr, hint Type) exprKind {
 
 		case *Array:
 			n := check.indexedElts(e.Elts, utyp.elem, utyp.len)
-			// if we have an "open" [...]T array, set the length now that we know it
+			// If we have an "open" [...]T array, set the length now that we know it
+			// and record the type for [...] (usually done by check.typExpr which is
+			// not called for [...]).
 			if openArray {
 				utyp.len = n
+				check.recordTypeAndValue(e.Type, typexpr, utyp, nil)
 			}
 
 		case *Slice:

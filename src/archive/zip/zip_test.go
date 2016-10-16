@@ -13,6 +13,7 @@ import (
 	"internal/testenv"
 	"io"
 	"io/ioutil"
+	"reflect"
 	"sort"
 	"strings"
 	"testing"
@@ -109,6 +110,44 @@ func TestFileHeaderRoundTrip64(t *testing.T) {
 		ModifiedDate:       5678,
 	}
 	testHeaderRoundTrip(fh, uint32max, fh.UncompressedSize64, t)
+}
+
+func TestZeroFileRoundTrip(t *testing.T) {
+	var b bytes.Buffer
+	w := NewWriter(&b)
+	if _, err := w.Create(""); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	r, err := NewReader(bytes.NewReader(b.Bytes()), int64(b.Len()))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify that fields that should reasonably be the zero value stays
+	// as the zero value.
+	var want FileHeader
+	if len(r.File) != 1 {
+		t.Fatalf("len(r.File) = %d, want 1", len(r.File))
+	}
+	fh := r.File[0].FileHeader
+	got := FileHeader{
+		Name:               fh.Name,
+		ModifiedTime:       fh.ModifiedTime,
+		ModifiedDate:       fh.ModifiedDate,
+		UncompressedSize:   fh.UncompressedSize,
+		UncompressedSize64: fh.UncompressedSize64,
+		ExternalAttrs:      fh.ExternalAttrs,
+		Comment:            fh.Comment,
+	}
+	if len(fh.Extra) > 0 {
+		got.Extra = fh.Extra
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("FileHeader mismatch:\ngot  %#v\nwant %#v", got, want)
+	}
 }
 
 type repeatedByte struct {
@@ -363,27 +402,6 @@ func testZip64DirectoryRecordLength(buf *rleBuffer, t *testing.T) {
 	size := b.uint64()
 	if size != directory64EndLen-12 {
 		t.Fatalf("Expected length of %d, got %d", directory64EndLen-12, size)
-	}
-}
-
-func testInvalidHeader(h *FileHeader, t *testing.T) {
-	var buf bytes.Buffer
-	z := NewWriter(&buf)
-
-	f, err := z.CreateHeader(h)
-	if err != nil {
-		t.Fatalf("error creating header: %v", err)
-	}
-	if _, err := f.Write([]byte("hi")); err != nil {
-		t.Fatalf("error writing content: %v", err)
-	}
-	if err := z.Close(); err != nil {
-		t.Fatalf("error closing zip writer: %v", err)
-	}
-
-	b := buf.Bytes()
-	if _, err = NewReader(bytes.NewReader(b), int64(len(b))); err != ErrFormat {
-		t.Fatalf("got %v, expected ErrFormat", err)
 	}
 }
 

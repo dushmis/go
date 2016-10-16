@@ -99,7 +99,7 @@ func (g *CommentGroup) Text() string {
 	}
 	comments := make([]string, len(g.List))
 	for i, c := range g.List {
-		comments[i] = string(c.Text)
+		comments[i] = c.Text
 	}
 
 	lines := make([]string, 0, 10) // most comments are less than 10 lines
@@ -317,7 +317,7 @@ type (
 		Fun      Expr      // function expression
 		Lparen   token.Pos // position of "("
 		Args     []Expr    // function arguments; or nil
-		Ellipsis token.Pos // position of "...", if any
+		Ellipsis token.Pos // position of "..." (token.NoPos if there is no "...")
 		Rparen   token.Pos // position of ")"
 	}
 
@@ -418,7 +418,7 @@ type (
 )
 
 // Pos and End implementations for expression/type nodes.
-//
+
 func (x *BadExpr) Pos() token.Pos  { return x.From }
 func (x *Ident) Pos() token.Pos    { return x.NamePos }
 func (x *Ellipsis) Pos() token.Pos { return x.Ellipsis }
@@ -709,7 +709,7 @@ type (
 )
 
 // Pos and End implementations for statement nodes.
-//
+
 func (s *BadStmt) Pos() token.Pos        { return s.From }
 func (s *DeclStmt) Pos() token.Pos       { return s.Decl.Pos() }
 func (s *EmptyStmt) Pos() token.Pos      { return s.Semicolon }
@@ -818,7 +818,7 @@ func (*RangeStmt) stmtNode()      {}
 // constant, type, or variable declaration.
 //
 type (
-	// The Spec type stands for any of *ImportSpec, *ValueSpec, and *TypeSpec.
+	// The Spec type stands for any of *ImportSpec, *AliasSpec, *ValueSpec, or *TypeSpec.
 	Spec interface {
 		Node
 		specNode()
@@ -831,6 +831,14 @@ type (
 		Path    *BasicLit     // import path
 		Comment *CommentGroup // line comments; or nil
 		EndPos  token.Pos     // end of spec (overrides Path.Pos if nonzero)
+	}
+
+	// An AliasSpec node represents a constant, type, variable, or function alias.
+	AliasSpec struct {
+		Doc     *CommentGroup // associated documentation; or nil
+		Name    *Ident        // alias name
+		Orig    Expr          // original (possibly qualified) name
+		Comment *CommentGroup // line comments; or nil
 	}
 
 	// A ValueSpec node represents a constant or variable declaration
@@ -854,13 +862,14 @@ type (
 )
 
 // Pos and End implementations for spec nodes.
-//
+
 func (s *ImportSpec) Pos() token.Pos {
 	if s.Name != nil {
 		return s.Name.Pos()
 	}
 	return s.Path.Pos()
 }
+func (s *AliasSpec) Pos() token.Pos { return s.Name.Pos() }
 func (s *ValueSpec) Pos() token.Pos { return s.Names[0].Pos() }
 func (s *TypeSpec) Pos() token.Pos  { return s.Name.Pos() }
 
@@ -870,7 +879,7 @@ func (s *ImportSpec) End() token.Pos {
 	}
 	return s.Path.End()
 }
-
+func (s *AliasSpec) End() token.Pos { return s.Orig.End() }
 func (s *ValueSpec) End() token.Pos {
 	if n := len(s.Values); n > 0 {
 		return s.Values[n-1].End()
@@ -886,6 +895,7 @@ func (s *TypeSpec) End() token.Pos { return s.Type.End() }
 // assigned to a Spec.
 //
 func (*ImportSpec) specNode() {}
+func (*AliasSpec) specNode()  {}
 func (*ValueSpec) specNode()  {}
 func (*TypeSpec) specNode()   {}
 
@@ -901,20 +911,22 @@ type (
 	}
 
 	// A GenDecl node (generic declaration node) represents an import,
-	// constant, type or variable declaration. A valid Lparen position
-	// (Lparen.Line > 0) indicates a parenthesized declaration.
+	// constant, type, or variable declaration, or a function alias
+	// declaration. A valid Lparen position (Lparen.Line > 0) indicates
+	// a parenthesized declaration.
 	//
 	// Relationship between Tok value and Specs element type:
 	//
 	//	token.IMPORT  *ImportSpec
-	//	token.CONST   *ValueSpec
-	//	token.TYPE    *TypeSpec
-	//	token.VAR     *ValueSpec
+	//	token.CONST   *ValueSpec or *AliasSpec
+	//	token.TYPE    *TypeSpec  or *AliasSpec
+	//	token.VAR     *ValueSpec or *AliasSpec
+	//	token.FUNC                  *AliasSpec
 	//
 	GenDecl struct {
 		Doc    *CommentGroup // associated documentation; or nil
 		TokPos token.Pos     // position of Tok
-		Tok    token.Token   // IMPORT, CONST, TYPE, VAR
+		Tok    token.Token   // IMPORT, CONST, TYPE, VAR, FUNC (alias decl only)
 		Lparen token.Pos     // position of '(', if any
 		Specs  []Spec
 		Rparen token.Pos // position of ')', if any
@@ -931,7 +943,7 @@ type (
 )
 
 // Pos and End implementations for declaration nodes.
-//
+
 func (d *BadDecl) Pos() token.Pos  { return d.From }
 func (d *GenDecl) Pos() token.Pos  { return d.TokPos }
 func (d *FuncDecl) Pos() token.Pos { return d.Type.Pos() }

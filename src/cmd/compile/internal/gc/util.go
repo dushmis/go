@@ -1,3 +1,7 @@
+// Copyright 2015 The Go Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
 package gc
 
 import (
@@ -12,7 +16,7 @@ func (n *Node) Line() string {
 
 var atExitFuncs []func()
 
-func AtExit(f func()) {
+func atExit(f func()) {
 	atExitFuncs = append(atExitFuncs, f)
 }
 
@@ -29,6 +33,8 @@ var (
 	cpuprofile     string
 	memprofile     string
 	memprofilerate int64
+	traceprofile   string
+	traceHandler   func(string)
 )
 
 func startProfile() {
@@ -40,7 +46,7 @@ func startProfile() {
 		if err := pprof.StartCPUProfile(f); err != nil {
 			Fatalf("%v", err)
 		}
-		AtExit(pprof.StopCPUProfile)
+		atExit(pprof.StopCPUProfile)
 	}
 	if memprofile != "" {
 		if memprofilerate != 0 {
@@ -50,11 +56,14 @@ func startProfile() {
 		if err != nil {
 			Fatalf("%v", err)
 		}
-		AtExit(func() {
+		atExit(func() {
 			runtime.GC() // profile all outstanding allocations
 			if err := pprof.WriteHeapProfile(f); err != nil {
 				Fatalf("%v", err)
 			}
 		})
+	}
+	if traceprofile != "" && traceHandler != nil {
+		traceHandler(traceprofile)
 	}
 }

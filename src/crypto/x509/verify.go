@@ -5,6 +5,7 @@
 package x509
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"net"
@@ -33,6 +34,9 @@ const (
 	// IncompatibleUsage results when the certificate's key usage indicates
 	// that it may only be used for a different purpose.
 	IncompatibleUsage
+	// NameMismatch results when the subject name of a parent certificate
+	// does not match the issuer name in the child.
+	NameMismatch
 )
 
 // CertificateInvalidError results when an odd error occurs. Users of this
@@ -54,6 +58,8 @@ func (e CertificateInvalidError) Error() string {
 		return "x509: too many intermediates for path length constraint"
 	case IncompatibleUsage:
 		return "x509: certificate specifies an incompatible key usage"
+	case NameMismatch:
+		return "x509: issuer name does not match subject from issuing certificate"
 	}
 	return "x509: unknown error"
 }
@@ -87,6 +93,10 @@ func (h HostnameError) Error() string {
 			valid = c.Subject.CommonName
 		}
 	}
+
+	if len(valid) == 0 {
+		return "x509: certificate is not valid for any names, but wanted to match " + h.Host
+	}
 	return "x509: certificate is valid for " + valid + ", not " + h.Host
 }
 
@@ -108,8 +118,9 @@ func (e UnknownAuthorityError) Error() string {
 		if len(certName) == 0 {
 			if len(e.hintCert.Subject.Organization) > 0 {
 				certName = e.hintCert.Subject.Organization[0]
+			} else {
+				certName = "serial:" + e.hintCert.SerialNumber.String()
 			}
-			certName = "serial:" + e.hintCert.SerialNumber.String()
 		}
 		s += fmt.Sprintf(" (possibly because of %q while trying to verify candidate authority certificate %q)", e.hintErr, certName)
 	}
@@ -117,10 +128,16 @@ func (e UnknownAuthorityError) Error() string {
 }
 
 // SystemRootsError results when we fail to load the system root certificates.
-type SystemRootsError struct{}
+type SystemRootsError struct {
+	Err error
+}
 
-func (SystemRootsError) Error() string {
-	return "x509: failed to load system roots and no roots provided"
+func (se SystemRootsError) Error() string {
+	msg := "x509: failed to load system roots and no roots provided"
+	if se.Err != nil {
+		return msg + "; " + se.Err.Error()
+	}
+	return msg
 }
 
 // errNotParsed is returned when a certificate without ASN.1 contents is
@@ -147,8 +164,40 @@ const (
 	rootCertificate
 )
 
+func matchNameConstraint(domain, constraint string) bool {
+	// The meaning of zero length constraints is not specified, but this
+	// code follows NSS and accepts them as valid for everything.
+	if len(constraint) == 0 {
+		return true
+	}
+
+	if len(domain) < len(constraint) {
+		return false
+	}
+
+	prefixLen := len(domain) - len(constraint)
+	if !strings.EqualFold(domain[prefixLen:], constraint) {
+		return false
+	}
+
+	if prefixLen == 0 {
+		return true
+	}
+
+	isSubdomain := domain[prefixLen-1] == '.'
+	constraintHasLeadingDot := constraint[0] == '.'
+	return isSubdomain != constraintHasLeadingDot
+}
+
 // isValid performs validity checks on the c.
 func (c *Certificate) isValid(certType int, currentChain []*Certificate, opts *VerifyOptions) error {
+	if len(currentChain) > 0 {
+		child := currentChain[len(currentChain)-1]
+		if !bytes.Equal(child.RawIssuer, c.RawSubject) {
+			return CertificateInvalidError{c, NameMismatch}
+		}
+	}
+
 	now := opts.CurrentTime
 	if now.IsZero() {
 		now = time.Now()
@@ -159,12 +208,9 @@ func (c *Certificate) isValid(certType int, currentChain []*Certificate, opts *V
 
 	if len(c.PermittedDNSDomains) > 0 {
 		ok := false
-		for _, domain := range c.PermittedDNSDomains {
-			if opts.DNSName == domain ||
-				(strings.HasSuffix(opts.DNSName, domain) &&
-					len(opts.DNSName) >= 1+len(domain) &&
-					opts.DNSName[len(opts.DNSName)-len(domain)-1] == '.') {
-				ok = true
+		for _, constraint := range c.PermittedDNSDomains {
+			ok = matchNameConstraint(opts.DNSName, constraint)
+			if ok {
 				break
 			}
 		}
@@ -179,7 +225,7 @@ func (c *Certificate) isValid(certType int, currentChain []*Certificate, opts *V
 	// being valid for encryption only, but no-one noticed. Another
 	// European CA marked its signature keys as not being valid for
 	// signatures. A different CA marked its own trusted root certificate
-	// as being invalid for certificate signing.  Another national CA
+	// as being invalid for certificate signing. Another national CA
 	// distributed a certificate to be used to encrypt data for the
 	// country’s tax authority that was marked as only being usable for
 	// digital signatures but not for encryption. Yet another CA reversed
@@ -240,7 +286,7 @@ func (c *Certificate) Verify(opts VerifyOptions) (chains [][]*Certificate, err e
 	if opts.Roots == nil {
 		opts.Roots = systemRootsPool()
 		if opts.Roots == nil {
-			return nil, SystemRootsError{}
+			return nil, SystemRootsError{systemRootsErr}
 		}
 	}
 
@@ -256,9 +302,13 @@ func (c *Certificate) Verify(opts VerifyOptions) (chains [][]*Certificate, err e
 		}
 	}
 
-	candidateChains, err := c.buildChains(make(map[int][][]*Certificate), []*Certificate{c}, &opts)
-	if err != nil {
-		return
+	var candidateChains [][]*Certificate
+	if opts.Roots.contains(c) {
+		candidateChains = append(candidateChains, []*Certificate{c})
+	} else {
+		if candidateChains, err = c.buildChains(make(map[int][][]*Certificate), []*Certificate{c}, &opts); err != nil {
+			return nil, err
+		}
 	}
 
 	keyUsages := opts.KeyUsages

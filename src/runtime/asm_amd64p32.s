@@ -133,7 +133,7 @@ TEXT runtime·gogo(SB), NOSPLIT, $0-4
 
 // func mcall(fn func(*g))
 // Switch to m->g0's stack, call fn(g).
-// Fn must never return.  It should gogo(&g->sched)
+// Fn must never return. It should gogo(&g->sched)
 // to keep running g.
 TEXT runtime·mcall(SB), NOSPLIT, $0-4
 	MOVL	fn+0(FP), DI
@@ -166,7 +166,7 @@ TEXT runtime·mcall(SB), NOSPLIT, $0-4
 	RET
 
 // systemstack_switch is a dummy routine that systemstack leaves at the bottom
-// of the G stack.  We need to distinguish the routine that
+// of the G stack. We need to distinguish the routine that
 // lives at the bottom of the G stack from the one that lives
 // at the top of the system stack because the one at the top of
 // the system stack terminates the stack walk (see topofstack()).
@@ -198,7 +198,7 @@ TEXT runtime·systemstack(SB), NOSPLIT, $0-4
 	CALL	AX
 
 switch:
-	// save our state in g->sched.  Pretend to
+	// save our state in g->sched. Pretend to
 	// be systemstack_switch if the G stack is scanned.
 	MOVL	$runtime·systemstack_switch(SB), SI
 	MOVL	SI, (g_sched+gobuf_pc)(AX)
@@ -449,13 +449,13 @@ TEXT runtime·asmcgocall(SB),NOSPLIT,$0-12
 
 // cgocallback(void (*fn)(void*), void *frame, uintptr framesize)
 // Not implemented.
-TEXT runtime·cgocallback(SB),NOSPLIT,$0-12
+TEXT runtime·cgocallback(SB),NOSPLIT,$0-16
 	MOVL	0, AX
 	RET
 
 // cgocallback_gofunc(FuncVal*, void *frame, uintptr framesize)
 // Not implemented.
-TEXT ·cgocallback_gofunc(SB),NOSPLIT,$0-12
+TEXT ·cgocallback_gofunc(SB),NOSPLIT,$0-16
 	MOVL	0, AX
 	RET
 
@@ -491,7 +491,7 @@ TEXT runtime·memclr(SB),NOSPLIT,$0-8
 	REP
 	STOSB
 	// Note: we zero only 4 bytes at a time so that the tail is at most
-	// 3 bytes.  That guarantees that we aren't zeroing pointers with STOSB.
+	// 3 bytes. That guarantees that we aren't zeroing pointers with STOSB.
 	// See issue 13160.
 	RET
 
@@ -519,11 +519,6 @@ setbar:
 	// Set the stack barrier return PC.
 	MOVL	BX, 0(SP)
 	CALL	runtime·setNextBarrierPC(SB)
-	RET
-
-TEXT runtime·getcallersp(SB),NOSPLIT,$0-12
-	MOVL	argp+0(FP), AX
-	MOVL	AX, ret+8(FP)
 	RET
 
 // int64 runtime·cputicks(void)
@@ -561,24 +556,30 @@ TEXT runtime·aeshash(SB),NOSPLIT,$0-20
 	MOVL	AX, ret+16(FP)
 	RET
 
-TEXT runtime·aeshashstr(SB),NOSPLIT,$0-20
-	MOVL	AX, ret+16(FP)
+TEXT runtime·aeshashstr(SB),NOSPLIT,$0-12
+	MOVL	AX, ret+8(FP)
 	RET
 
-TEXT runtime·aeshash32(SB),NOSPLIT,$0-20
-	MOVL	AX, ret+16(FP)
+TEXT runtime·aeshash32(SB),NOSPLIT,$0-12
+	MOVL	AX, ret+8(FP)
 	RET
 
-TEXT runtime·aeshash64(SB),NOSPLIT,$0-20
-	MOVL	AX, ret+16(FP)
+TEXT runtime·aeshash64(SB),NOSPLIT,$0-12
+	MOVL	AX, ret+8(FP)
 	RET
 
-TEXT runtime·memeq(SB),NOSPLIT,$0-17
+// memequal(p, q unsafe.Pointer, size uintptr) bool
+TEXT runtime·memequal(SB),NOSPLIT,$0-17
 	MOVL	a+0(FP), SI
 	MOVL	b+4(FP), DI
+	CMPL	SI, DI
+	JEQ	eq
 	MOVL	size+8(FP), BX
 	CALL	runtime·memeqbody(SB)
 	MOVB	AX, ret+16(FP)
+	RET
+eq:
+	MOVB    $1, ret+16(FP)
 	RET
 
 // memequal_varlen(a, b unsafe.Pointer) bool
@@ -601,16 +602,16 @@ eq:
 // See runtime_test.go:eqstring_generic for
 // equivalent Go code.
 TEXT runtime·eqstring(SB),NOSPLIT,$0-17
-	MOVL	s1str+0(FP), SI
-	MOVL	s2str+8(FP), DI
+	MOVL	s1_base+0(FP), SI
+	MOVL	s2_base+8(FP), DI
 	CMPL	SI, DI
 	JEQ	same
-	MOVL	s1len+4(FP), BX
+	MOVL	s1_len+4(FP), BX
 	CALL	runtime·memeqbody(SB)
-	MOVB	AX, v+16(FP)
+	MOVB	AX, ret+16(FP)
 	RET
 same:
-	MOVB	$1, v+16(FP)
+	MOVB	$1, ret+16(FP)
 	RET
 
 // a in SI
@@ -686,7 +687,7 @@ small:
 	MOVQ	(SI), SI
 	JMP	si_finish
 si_high:
-	// address ends in 11111xxx.  Load up to bytes we want, move to correct position.
+	// address ends in 11111xxx. Load up to bytes we want, move to correct position.
 	MOVQ	BX, DX
 	ADDQ	SI, DX
 	MOVQ	-8(DX), SI
@@ -967,7 +968,7 @@ eqret:
 	MOVB	AX, ret+24(FP)
 	RET
 
-TEXT runtime·fastrand1(SB), NOSPLIT, $0-4
+TEXT runtime·fastrand(SB), NOSPLIT, $0-4
 	get_tls(CX)
 	MOVL	g(CX), AX
 	MOVL	g_m(AX), AX

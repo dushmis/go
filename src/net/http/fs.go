@@ -34,7 +34,7 @@ import (
 type Dir string
 
 func (d Dir) Open(name string) (File, error) {
-	if filepath.Separator != '/' && strings.IndexRune(name, filepath.Separator) >= 0 ||
+	if filepath.Separator != '/' && strings.ContainsRune(name, filepath.Separator) ||
 		strings.Contains(name, "\x00") {
 		return nil, errors.New("http: invalid character in file path")
 	}
@@ -77,7 +77,7 @@ func dirList(w ResponseWriter, f File) {
 		Error(w, "Error reading directory", StatusInternalServerError)
 		return
 	}
-	sort.Sort(byName(dirs))
+	sort.Slice(dirs, func(i, j int) bool { return dirs[i].Name() < dirs[j].Name() })
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	fmt.Fprintf(w, "<pre>\n")
@@ -96,7 +96,7 @@ func dirList(w ResponseWriter, f File) {
 }
 
 // ServeContent replies to the request using the content in the
-// provided ReadSeeker.  The main benefit of ServeContent over io.Copy
+// provided ReadSeeker. The main benefit of ServeContent over io.Copy
 // is that it handles Range requests properly, sets the MIME type, and
 // handles If-Modified-Since requests.
 //
@@ -108,7 +108,7 @@ func dirList(w ResponseWriter, f File) {
 // never sent in the response.
 //
 // If modtime is not the zero time or Unix epoch, ServeContent
-// includes it in a Last-Modified header in the response.  If the
+// includes it in a Last-Modified header in the response. If the
 // request includes an If-Modified-Since header, ServeContent uses
 // modtime to decide whether the content needs to be sent at all.
 //
@@ -121,11 +121,11 @@ func dirList(w ResponseWriter, f File) {
 // Note that *os.File implements the io.ReadSeeker interface.
 func ServeContent(w ResponseWriter, req *Request, name string, modtime time.Time, content io.ReadSeeker) {
 	sizeFunc := func() (int64, error) {
-		size, err := content.Seek(0, os.SEEK_END)
+		size, err := content.Seek(0, io.SeekEnd)
 		if err != nil {
 			return 0, errSeeker
 		}
-		_, err = content.Seek(0, os.SEEK_SET)
+		_, err = content.Seek(0, io.SeekStart)
 		if err != nil {
 			return 0, errSeeker
 		}
@@ -139,6 +139,10 @@ func ServeContent(w ResponseWriter, req *Request, name string, modtime time.Time
 // included in the sizeFunc reply so it's not sent over HTTP to end
 // users.
 var errSeeker = errors.New("seeker can't seek")
+
+// errNoOverlap is returned by serveContent's parseRange if first-byte-pos of
+// all of the byte-range-spec values is greater than the content size.
+var errNoOverlap = errors.New("invalid range: failed to overlap")
 
 // if name is empty, filename is unknown. (used for mime type, before sniffing)
 // if modtime.IsZero(), modtime is unknown.
@@ -166,7 +170,7 @@ func serveContent(w ResponseWriter, r *Request, name string, modtime time.Time, 
 			var buf [sniffLen]byte
 			n, _ := io.ReadFull(content, buf[:])
 			ctype = DetectContentType(buf[:n])
-			_, err := content.Seek(0, os.SEEK_SET) // rewind to output whole file
+			_, err := content.Seek(0, io.SeekStart) // rewind to output whole file
 			if err != nil {
 				Error(w, "seeker can't seek", StatusInternalServerError)
 				return
@@ -189,6 +193,9 @@ func serveContent(w ResponseWriter, r *Request, name string, modtime time.Time, 
 	if size >= 0 {
 		ranges, err := parseRange(rangeReq, size)
 		if err != nil {
+			if err == errNoOverlap {
+				w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", size))
+			}
 			Error(w, err.Error(), StatusRequestedRangeNotSatisfiable)
 			return
 		}
@@ -196,7 +203,7 @@ func serveContent(w ResponseWriter, r *Request, name string, modtime time.Time, 
 			// The total number of bytes in all the ranges
 			// is larger than the size of the file by
 			// itself, so this is probably an attack, or a
-			// dumb client.  Ignore the range request.
+			// dumb client. Ignore the range request.
 			ranges = nil
 		}
 		switch {
@@ -213,7 +220,7 @@ func serveContent(w ResponseWriter, r *Request, name string, modtime time.Time, 
 			// A response to a request for a single range MUST NOT
 			// be sent using the multipart/byteranges media type."
 			ra := ranges[0]
-			if _, err := content.Seek(ra.start, os.SEEK_SET); err != nil {
+			if _, err := content.Seek(ra.start, io.SeekStart); err != nil {
 				Error(w, err.Error(), StatusRequestedRangeNotSatisfiable)
 				return
 			}
@@ -236,7 +243,7 @@ func serveContent(w ResponseWriter, r *Request, name string, modtime time.Time, 
 						pw.CloseWithError(err)
 						return
 					}
-					if _, err := content.Seek(ra.start, os.SEEK_SET); err != nil {
+					if _, err := content.Seek(ra.start, io.SeekStart); err != nil {
 						pw.CloseWithError(err)
 						return
 					}
@@ -291,7 +298,7 @@ func checkLastModified(w ResponseWriter, r *Request, modtime time.Time) bool {
 // checkETag implements If-None-Match and If-Range checks.
 //
 // The ETag or modtime must have been previously set in the
-// ResponseWriter's headers.  The modtime is only compared at second
+// ResponseWriter's headers. The modtime is only compared at second
 // granularity and may be the zero value to mean unknown.
 //
 // The return value is the effective request "Range" header to use and
@@ -336,7 +343,7 @@ func checkETag(w ResponseWriter, r *Request, modtime time.Time) (rangeReq string
 		}
 
 		// TODO(bradfitz): deal with comma-separated or multiple-valued
-		// list of If-None-match values.  For now just handle the common
+		// list of If-None-match values. For now just handle the common
 		// case of a single item.
 		if inm == etag || inm == "*" {
 			h := w.Header()
@@ -390,6 +397,15 @@ func serveFile(w ResponseWriter, r *Request, fs FileSystem, name string, redirec
 				localRedirect(w, r, "../"+path.Base(url))
 				return
 			}
+		}
+	}
+
+	// redirect if the directory name doesn't end in a slash
+	if d.IsDir() {
+		url := r.URL.Path
+		if url[len(url)-1] != '/' {
+			localRedirect(w, r, path.Base(url)+"/")
+			return
 		}
 	}
 
@@ -451,14 +467,43 @@ func localRedirect(w ResponseWriter, r *Request, newPath string) {
 // ServeFile replies to the request with the contents of the named
 // file or directory.
 //
+// If the provided file or directory name is a relative path, it is
+// interpreted relative to the current directory and may ascend to parent
+// directories. If the provided name is constructed from user input, it
+// should be sanitized before calling ServeFile. As a precaution, ServeFile
+// will reject requests where r.URL.Path contains a ".." path element.
+//
 // As a special case, ServeFile redirects any request where r.URL.Path
 // ends in "/index.html" to the same path, without the final
 // "index.html". To avoid such redirects either modify the path or
 // use ServeContent.
 func ServeFile(w ResponseWriter, r *Request, name string) {
+	if containsDotDot(r.URL.Path) {
+		// Too many programs use r.URL.Path to construct the argument to
+		// serveFile. Reject the request under the assumption that happened
+		// here and ".." may not be wanted.
+		// Note that name might not contain "..", for example if code (still
+		// incorrectly) used filepath.Join(myDir, r.URL.Path).
+		Error(w, "invalid URL path", StatusBadRequest)
+		return
+	}
 	dir, file := filepath.Split(name)
 	serveFile(w, r, Dir(dir), file, false)
 }
+
+func containsDotDot(v string) bool {
+	if !strings.Contains(v, "..") {
+		return false
+	}
+	for _, ent := range strings.FieldsFunc(v, isSlashRune) {
+		if ent == ".." {
+			return true
+		}
+	}
+	return false
+}
+
+func isSlashRune(r rune) bool { return r == '/' || r == '\\' }
 
 type fileHandler struct {
 	root FileSystem
@@ -505,6 +550,7 @@ func (r httpRange) mimeHeader(contentType string, size int64) textproto.MIMEHead
 }
 
 // parseRange parses a Range header string as per RFC 2616.
+// errNoOverlap is returned if none of the ranges overlap.
 func parseRange(s string, size int64) ([]httpRange, error) {
 	if s == "" {
 		return nil, nil // header not present
@@ -514,6 +560,7 @@ func parseRange(s string, size int64) ([]httpRange, error) {
 		return nil, errors.New("invalid range")
 	}
 	var ranges []httpRange
+	noOverlap := false
 	for _, ra := range strings.Split(s[len(b):], ",") {
 		ra = strings.TrimSpace(ra)
 		if ra == "" {
@@ -539,8 +586,14 @@ func parseRange(s string, size int64) ([]httpRange, error) {
 			r.length = size - r.start
 		} else {
 			i, err := strconv.ParseInt(start, 10, 64)
-			if err != nil || i >= size || i < 0 {
+			if err != nil || i < 0 {
 				return nil, errors.New("invalid range")
+			}
+			if i >= size {
+				// If the range begins after the size of the content,
+				// then it does not overlap.
+				noOverlap = true
+				continue
 			}
 			r.start = i
 			if end == "" {
@@ -558,6 +611,10 @@ func parseRange(s string, size int64) ([]httpRange, error) {
 			}
 		}
 		ranges = append(ranges, r)
+	}
+	if noOverlap && len(ranges) == 0 {
+		// The specified ranges did not overlap with the content.
+		return nil, errNoOverlap
 	}
 	return ranges, nil
 }
@@ -590,9 +647,3 @@ func sumRangesSize(ranges []httpRange) (size int64) {
 	}
 	return
 }
-
-type byName []os.FileInfo
-
-func (s byName) Len() int           { return len(s) }
-func (s byName) Less(i, j int) bool { return s[i].Name() < s[j].Name() }
-func (s byName) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }

@@ -85,7 +85,7 @@ func Loadp(addr unsafe.Pointer) unsafe.Pointer {
 }
 
 //go:nosplit
-func Storep1(addr unsafe.Pointer, v unsafe.Pointer) {
+func StorepNoWB(addr unsafe.Pointer, v unsafe.Pointer) {
 	for {
 		old := *(*unsafe.Pointer)(addr)
 		if Casp1((*unsafe.Pointer)(addr), old, v) {
@@ -181,3 +181,6 @@ func And8(addr *uint8, v uint8) {
 		}
 	}
 }
+
+//go:nosplit
+func armcas(ptr *uint32, old, new uint32) bool

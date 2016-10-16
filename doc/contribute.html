@@ -16,6 +16,10 @@ have <a href="code.html">written and tested your code</a>.
 see <a href="gccgo_contribute.html">Contributing to gccgo</a>.)
 </p>
 
+<p>
+Sensitive security-related issues should be reported to <a href="mailto:security@golang.org">security@golang.org</a>.
+</p>
+
 <h2 id="Design">Discuss your design</h2>
 
 <p>
@@ -78,7 +82,7 @@ no matter who makes the change.
 A custom git command called <code>git-codereview</code>,
 discussed below, helps manage the code review process through a Google-hosted
 <a href="https://go-review.googlesource.com/">instance</a> of the code review
-system called <a href="https://code.google.com/p/gerrit/">Gerrit</a>.
+system called <a href="https://www.gerritcodereview.com/">Gerrit</a>.
 </p>
 
 <h3 id="auth">Set up authentication for code review</h3>
@@ -198,14 +202,24 @@ prints help text, not an error.
 </p>
 
 <p>
-Note to Git aficionados: The <code>git-codereview</code> command is not required to
+<b>Note to Git aficionados:</b>
+The <code>git-codereview</code> command is not required to
 upload and manage Gerrit code reviews. For those who prefer plain Git, the text
-below gives the Git equivalent of each git-codereview command. If you do use plain
+below gives the Git equivalent of each git-codereview command.
+</p>
+
+<p>If you do use plain
 Git, note that you still need the commit hooks that the git-codereview command
 configures; those hooks add a Gerrit <code>Change-Id</code> line to the commit
 message and check that all Go source files have been formatted with gofmt. Even
 if you intend to use plain Git for daily work, install the hooks in a new Git
 checkout by running <code>git-codereview</code> <code>hooks</code>.
+</p>
+
+<p>
+The workflow described below assumes a single change per branch.
+It is also possible to prepare a sequence of (usually related) changes in a single branch.
+See the <a href="https://golang.org/x/review/git-codereview">git-codereview documentation</a> for details.
 </p>
 
 <h3 id="git-config">Set up git aliases</h3>
@@ -339,10 +353,13 @@ with a thorough description of your change.
 The first line of the change description is conventionally a one-line
 summary of the change, prefixed by the primary affected package,
 and is used as the subject for code review mail.
-The rest of the
-description elaborates and should provide context for the
+It should complete the sentence "This change modifies Go to _____."
+The rest of the description elaborates and should provide context for the
 change and explain what it does.
+Write in complete sentences with correct punctuation, just like
+for your comments in Go.
 If there is a helpful reference, mention it here.
+If you've fixed an issue, reference it by number with a # before it.
 </p>
 
 <p>
@@ -350,7 +367,7 @@ After editing, the template might now read:
 </p>
 
 <pre>
-math: improved Sin, Cos and Tan precision for very large arguments
+math: improve Sin, Cos and Tan precision for very large arguments
 
 The existing implementation has poor numerical properties for
 large arguments, so use the McGillicutty algorithm to improve

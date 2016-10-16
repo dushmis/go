@@ -4,10 +4,7 @@
 
 package runtime
 
-import (
-	"runtime/internal/atomic"
-	"unsafe"
-)
+import "unsafe"
 
 // The constant is known to the compiler.
 // There is no fundamental theory behind this number.
@@ -47,10 +44,9 @@ func concatstrings(buf *tmpBuf, a []string) string {
 		return a[idx]
 	}
 	s, b := rawstringtmp(buf, l)
-	l = 0
 	for _, x := range a {
-		copy(b[l:], x)
-		l += len(x)
+		copy(b, x)
+		b = b[len(x):]
 	}
 	return s
 }
@@ -84,7 +80,7 @@ func slicebytetostring(buf *tmpBuf, b []byte) string {
 	if raceenabled && l > 0 {
 		racereadrangepc(unsafe.Pointer(&b[0]),
 			uintptr(l),
-			getcallerpc(unsafe.Pointer(&b)),
+			getcallerpc(unsafe.Pointer(&buf)),
 			funcPC(slicebytetostring))
 	}
 	if msanenabled && l > 0 {
@@ -113,17 +109,20 @@ func rawstringtmp(buf *tmpBuf, l int) (s string, b []byte) {
 	return
 }
 
+// slicebytetostringtmp returns a "string" referring to the actual []byte bytes.
+//
+// Callers need to ensure that the returned string will not be used after
+// the calling goroutine modifies the original slice or synchronizes with
+// another goroutine.
+//
+// The function is only called when instrumenting
+// and otherwise intrinsified by the compiler.
+//
+// Some internal compiler optimizations use this function.
+// - Used for m[string(k)] lookup where m is a string-keyed map and k is a []byte.
+// - Used for "<"+string(b)+">" concatenation where b is []byte.
+// - Used for string(b)=="foo" comparison where b is []byte.
 func slicebytetostringtmp(b []byte) string {
-	// Return a "string" referring to the actual []byte bytes.
-	// This is only for use by internal compiler optimizations
-	// that know that the string form will be discarded before
-	// the calling goroutine could possibly modify the original
-	// slice or synchronize with another goroutine.
-	// First such case is a m[string(k)] lookup where
-	// m is a string-keyed map and k is a []byte.
-	// Second such case is "<"+string(b)+">" concatenation where b is []byte.
-	// Third such case is string(b)=="foo" comparison where b is []byte.
-
 	if raceenabled && len(b) > 0 {
 		racereadrangepc(unsafe.Pointer(&b[0]),
 			uintptr(len(b)),
@@ -139,6 +138,7 @@ func slicebytetostringtmp(b []byte) string {
 func stringtoslicebyte(buf *tmpBuf, s string) []byte {
 	var b []byte
 	if buf != nil && len(s) <= len(buf) {
+		*buf = tmpBuf{}
 		b = buf[:len(s)]
 	} else {
 		b = rawbyteslice(len(s))
@@ -155,7 +155,7 @@ func stringtoslicebytetmp(s string) []byte {
 	// for i, c := range []byte(str)
 
 	str := stringStructOf(&s)
-	ret := slice{array: unsafe.Pointer(str.str), len: str.len, cap: str.len}
+	ret := slice{array: str.str, len: str.len, cap: str.len}
 	return *(*[]byte)(unsafe.Pointer(&ret))
 }
 
@@ -163,22 +163,20 @@ func stringtoslicerune(buf *[tmpStringBufSize]rune, s string) []rune {
 	// two passes.
 	// unlike slicerunetostring, no race because strings are immutable.
 	n := 0
-	t := s
-	for len(s) > 0 {
-		_, k := charntorune(s)
-		s = s[k:]
+	for range s {
 		n++
 	}
+
 	var a []rune
 	if buf != nil && n <= len(buf) {
+		*buf = [tmpStringBufSize]rune{}
 		a = buf[:n]
 	} else {
 		a = rawruneslice(n)
 	}
+
 	n = 0
-	for len(t) > 0 {
-		r, k := charntorune(t)
-		t = t[k:]
+	for _, r := range s {
 		a[n] = r
 		n++
 	}
@@ -189,7 +187,7 @@ func slicerunetostring(buf *tmpBuf, a []rune) string {
 	if raceenabled && len(a) > 0 {
 		racereadrangepc(unsafe.Pointer(&a[0]),
 			uintptr(len(a))*unsafe.Sizeof(a[0]),
-			getcallerpc(unsafe.Pointer(&a)),
+			getcallerpc(unsafe.Pointer(&buf)),
 			funcPC(slicerunetostring))
 	}
 	if msanenabled && len(a) > 0 {
@@ -236,44 +234,11 @@ func intstring(buf *[4]byte, v int64) string {
 	} else {
 		s, b = rawstring(4)
 	}
+	if int64(rune(v)) != v {
+		v = runeerror
+	}
 	n := runetochar(b, rune(v))
 	return s[:n]
-}
-
-// stringiter returns the index of the next
-// rune after the rune that starts at s[k].
-func stringiter(s string, k int) int {
-	if k >= len(s) {
-		// 0 is end of iteration
-		return 0
-	}
-
-	c := s[k]
-	if c < runeself {
-		return k + 1
-	}
-
-	// multi-char rune
-	_, n := charntorune(s[k:])
-	return k + n
-}
-
-// stringiter2 returns the rune that starts at s[k]
-// and the index where the next rune starts.
-func stringiter2(s string, k int) (int, rune) {
-	if k >= len(s) {
-		// 0 is end of iteration
-		return 0, 0
-	}
-
-	c := s[k]
-	if c < runeself {
-		return k + 1, rune(c)
-	}
-
-	// multi-char rune
-	r, n := charntorune(s[k:])
-	return k + n, r
 }
 
 // rawstring allocates storage for a new string. The returned
@@ -281,25 +246,20 @@ func stringiter2(s string, k int) (int, rune) {
 // The storage is not zeroed. Callers should use
 // b to set the string contents and then drop b.
 func rawstring(size int) (s string, b []byte) {
-	p := mallocgc(uintptr(size), nil, flagNoScan|flagNoZero)
+	p := mallocgc(uintptr(size), nil, false)
 
 	stringStructOf(&s).str = p
 	stringStructOf(&s).len = size
 
 	*(*slice)(unsafe.Pointer(&b)) = slice{p, size, size}
 
-	for {
-		ms := maxstring
-		if uintptr(size) <= uintptr(ms) || atomic.Casuintptr((*uintptr)(unsafe.Pointer(&maxstring)), uintptr(ms), uintptr(size)) {
-			return
-		}
-	}
+	return
 }
 
 // rawbyteslice allocates a new byte slice. The byte slice is not zeroed.
 func rawbyteslice(size int) (b []byte) {
 	cap := roundupsize(uintptr(size))
-	p := mallocgc(cap, nil, flagNoScan|flagNoZero)
+	p := mallocgc(cap, nil, false)
 	if cap != uintptr(size) {
 		memclr(add(p, uintptr(size)), cap-uintptr(size))
 	}
@@ -314,7 +274,7 @@ func rawruneslice(size int) (b []rune) {
 		throw("out of memory")
 	}
 	mem := roundupsize(uintptr(size) * 4)
-	p := mallocgc(mem, nil, flagNoScan|flagNoZero)
+	p := mallocgc(mem, nil, false)
 	if mem != uintptr(size)*4 {
 		memclr(add(p, uintptr(size)*4), mem-uintptr(size)*4)
 	}
@@ -406,18 +366,10 @@ func findnullw(s *uint16) int {
 	return l
 }
 
-var maxstring uintptr = 256 // a hint for print
-
 //go:nosplit
 func gostringnocopy(str *byte) string {
 	ss := stringStruct{str: unsafe.Pointer(str), len: findnull(str)}
 	s := *(*string)(unsafe.Pointer(&ss))
-	for {
-		ms := maxstring
-		if uintptr(len(s)) <= ms || atomic.Casuintptr(&maxstring, ms, uintptr(len(s))) {
-			break
-		}
-	}
 	return s
 }
 

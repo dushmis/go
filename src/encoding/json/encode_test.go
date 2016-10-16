@@ -6,8 +6,12 @@ package json
 
 import (
 	"bytes"
+	"fmt"
+	"log"
 	"math"
 	"reflect"
+	"regexp"
+	"strconv"
 	"testing"
 	"unicode"
 )
@@ -375,41 +379,45 @@ func TestDuplicatedFieldDisappears(t *testing.T) {
 
 func TestStringBytes(t *testing.T) {
 	// Test that encodeState.stringBytes and encodeState.string use the same encoding.
-	es := &encodeState{}
 	var r []rune
 	for i := '\u0000'; i <= unicode.MaxRune; i++ {
 		r = append(r, i)
 	}
 	s := string(r) + "\xff\xff\xffhello" // some invalid UTF-8 too
-	es.string(s)
 
-	esBytes := &encodeState{}
-	esBytes.stringBytes([]byte(s))
+	for _, escapeHTML := range []bool{true, false} {
+		es := &encodeState{}
+		es.string(s, escapeHTML)
 
-	enc := es.Buffer.String()
-	encBytes := esBytes.Buffer.String()
-	if enc != encBytes {
-		i := 0
-		for i < len(enc) && i < len(encBytes) && enc[i] == encBytes[i] {
-			i++
-		}
-		enc = enc[i:]
-		encBytes = encBytes[i:]
-		i = 0
-		for i < len(enc) && i < len(encBytes) && enc[len(enc)-i-1] == encBytes[len(encBytes)-i-1] {
-			i++
-		}
-		enc = enc[:len(enc)-i]
-		encBytes = encBytes[:len(encBytes)-i]
+		esBytes := &encodeState{}
+		esBytes.stringBytes([]byte(s), escapeHTML)
 
-		if len(enc) > 20 {
-			enc = enc[:20] + "..."
-		}
-		if len(encBytes) > 20 {
-			encBytes = encBytes[:20] + "..."
-		}
+		enc := es.Buffer.String()
+		encBytes := esBytes.Buffer.String()
+		if enc != encBytes {
+			i := 0
+			for i < len(enc) && i < len(encBytes) && enc[i] == encBytes[i] {
+				i++
+			}
+			enc = enc[i:]
+			encBytes = encBytes[i:]
+			i = 0
+			for i < len(enc) && i < len(encBytes) && enc[len(enc)-i-1] == encBytes[len(encBytes)-i-1] {
+				i++
+			}
+			enc = enc[:len(enc)-i]
+			encBytes = encBytes[:len(encBytes)-i]
 
-		t.Errorf("encodings differ at %#q vs %#q", enc, encBytes)
+			if len(enc) > 20 {
+				enc = enc[:20] + "..."
+			}
+			if len(encBytes) > 20 {
+				encBytes = encBytes[:20] + "..."
+			}
+
+			t.Errorf("with escapeHTML=%t, encodings differ at %#q vs %#q",
+				escapeHTML, enc, encBytes)
+		}
 	}
 }
 
@@ -535,4 +543,177 @@ func TestEncodeString(t *testing.T) {
 			t.Errorf("Marshal(%q) = %#q, want %#q", tt.in, out, tt.out)
 		}
 	}
+}
+
+type jsonbyte byte
+
+func (b jsonbyte) MarshalJSON() ([]byte, error) { return tenc(`{"JB":%d}`, b) }
+
+type textbyte byte
+
+func (b textbyte) MarshalText() ([]byte, error) { return tenc(`TB:%d`, b) }
+
+type jsonint int
+
+func (i jsonint) MarshalJSON() ([]byte, error) { return tenc(`{"JI":%d}`, i) }
+
+type textint int
+
+func (i textint) MarshalText() ([]byte, error) { return tenc(`TI:%d`, i) }
+
+func tenc(format string, a ...interface{}) ([]byte, error) {
+	var buf bytes.Buffer
+	fmt.Fprintf(&buf, format, a...)
+	return buf.Bytes(), nil
+}
+
+// Issue 13783
+func TestEncodeBytekind(t *testing.T) {
+	testdata := []struct {
+		data interface{}
+		want string
+	}{
+		{byte(7), "7"},
+		{jsonbyte(7), `{"JB":7}`},
+		{textbyte(4), `"TB:4"`},
+		{jsonint(5), `{"JI":5}`},
+		{textint(1), `"TI:1"`},
+		{[]byte{0, 1}, `"AAE="`},
+		{[]jsonbyte{0, 1}, `[{"JB":0},{"JB":1}]`},
+		{[][]jsonbyte{{0, 1}, {3}}, `[[{"JB":0},{"JB":1}],[{"JB":3}]]`},
+		{[]textbyte{2, 3}, `["TB:2","TB:3"]`},
+		{[]jsonint{5, 4}, `[{"JI":5},{"JI":4}]`},
+		{[]textint{9, 3}, `["TI:9","TI:3"]`},
+		{[]int{9, 3}, `[9,3]`},
+	}
+	for _, d := range testdata {
+		js, err := Marshal(d.data)
+		if err != nil {
+			t.Error(err)
+			continue
+		}
+		got, want := string(js), d.want
+		if got != want {
+			t.Errorf("got %s, want %s", got, want)
+		}
+	}
+}
+
+func TestTextMarshalerMapKeysAreSorted(t *testing.T) {
+	b, err := Marshal(map[unmarshalerText]int{
+		{"x", "y"}: 1,
+		{"y", "x"}: 2,
+		{"a", "z"}: 3,
+		{"z", "a"}: 4,
+	})
+	if err != nil {
+		t.Fatalf("Failed to Marshal text.Marshaler: %v", err)
+	}
+	const want = `{"a:z":3,"x:y":1,"y:x":2,"z:a":4}`
+	if string(b) != want {
+		t.Errorf("Marshal map with text.Marshaler keys: got %#q, want %#q", b, want)
+	}
+}
+
+var re = regexp.MustCompile
+
+// syntactic checks on form of marshalled floating point numbers.
+var badFloatREs = []*regexp.Regexp{
+	re(`p`),                     // no binary exponential notation
+	re(`^\+`),                   // no leading + sign
+	re(`^-?0[^.]`),              // no unnecessary leading zeros
+	re(`^-?\.`),                 // leading zero required before decimal point
+	re(`\.(e|$)`),               // no trailing decimal
+	re(`\.[0-9]+0(e|$)`),        // no trailing zero in fraction
+	re(`^-?(0|[0-9]{2,})\..*e`), // exponential notation must have normalized mantissa
+	re(`e[0-9]`),                // positive exponent must be signed
+	re(`e[+-]0`),                // exponent must not have leading zeros
+	re(`e-[1-6]$`),              // not tiny enough for exponential notation
+	re(`e+(.|1.|20)$`),          // not big enough for exponential notation
+	re(`^-?0\.0000000`),         // too tiny, should use exponential notation
+	re(`^-?[0-9]{22}`),          // too big, should use exponential notation
+	re(`[1-9][0-9]{16}[1-9]`),   // too many significant digits in integer
+	re(`[1-9][0-9.]{17}[1-9]`),  // too many significant digits in decimal
+	// below here for float32 only
+	re(`[1-9][0-9]{8}[1-9]`),  // too many significant digits in integer
+	re(`[1-9][0-9.]{9}[1-9]`), // too many significant digits in decimal
+}
+
+func TestMarshalFloat(t *testing.T) {
+	nfail := 0
+	test := func(f float64, bits int) {
+		vf := interface{}(f)
+		if bits == 32 {
+			f = float64(float32(f)) // round
+			vf = float32(f)
+		}
+		bout, err := Marshal(vf)
+		if err != nil {
+			t.Errorf("Marshal(%T(%g)): %v", vf, vf, err)
+			nfail++
+			return
+		}
+		out := string(bout)
+
+		// result must convert back to the same float
+		g, err := strconv.ParseFloat(out, bits)
+		if err != nil {
+			t.Errorf("Marshal(%T(%g)) = %q, cannot parse back: %v", vf, vf, out, err)
+			nfail++
+			return
+		}
+		if f != g || fmt.Sprint(f) != fmt.Sprint(g) { // fmt.Sprint handles ±0
+			t.Errorf("Marshal(%T(%g)) = %q (is %g, not %g)", vf, vf, out, float32(g), vf)
+			nfail++
+			return
+		}
+
+		bad := badFloatREs
+		if bits == 64 {
+			bad = bad[:len(bad)-2]
+		}
+		for _, re := range bad {
+			if re.MatchString(out) {
+				t.Errorf("Marshal(%T(%g)) = %q, must not match /%s/", vf, vf, out, re)
+				nfail++
+				return
+			}
+		}
+	}
+
+	var (
+		bigger  = math.Inf(+1)
+		smaller = math.Inf(-1)
+	)
+
+	var digits = "1.2345678901234567890123"
+	for i := len(digits); i >= 2; i-- {
+		for exp := -30; exp <= 30; exp++ {
+			for _, sign := range "+-" {
+				for bits := 32; bits <= 64; bits += 32 {
+					s := fmt.Sprintf("%c%se%d", sign, digits[:i], exp)
+					f, err := strconv.ParseFloat(s, bits)
+					if err != nil {
+						log.Fatal(err)
+					}
+					next := math.Nextafter
+					if bits == 32 {
+						next = func(g, h float64) float64 {
+							return float64(math.Nextafter32(float32(g), float32(h)))
+						}
+					}
+					test(f, bits)
+					test(next(f, bigger), bits)
+					test(next(f, smaller), bits)
+					if nfail > 50 {
+						t.Fatalf("stopping test early")
+					}
+				}
+			}
+		}
+	}
+	test(0, 64)
+	test(math.Copysign(0, -1), 64)
+	test(0, 32)
+	test(math.Copysign(0, -1), 32)
 }

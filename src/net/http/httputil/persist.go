@@ -15,9 +15,14 @@ import (
 )
 
 var (
+	// Deprecated: No longer used.
 	ErrPersistEOF = &http.ProtocolError{ErrorString: "persistent connection closed"}
-	ErrClosed     = &http.ProtocolError{ErrorString: "connection closed by user"}
-	ErrPipeline   = &http.ProtocolError{ErrorString: "pipeline error"}
+
+	// Deprecated: No longer used.
+	ErrClosed = &http.ProtocolError{ErrorString: "connection closed by user"}
+
+	// Deprecated: No longer used.
+	ErrPipeline = &http.ProtocolError{ErrorString: "pipeline error"}
 )
 
 // This is an API usage error - the local side is closed.
@@ -287,8 +292,8 @@ func (cc *ClientConn) Close() error {
 }
 
 // Write writes a request. An ErrPersistEOF error is returned if the connection
-// has been closed in an HTTP keepalive sense. If req.Close equals true, the
-// keepalive connection is logically closed after this request and the opposing
+// has been closed in an HTTP keep-alive sense. If req.Close equals true, the
+// keep-alive connection is logically closed after this request and the opposing
 // server is informed. An ErrUnexpectedEOF indicates the remote closed the
 // underlying TCP connection, which is usually considered as graceful close.
 func (cc *ClientConn) Write(req *http.Request) error {

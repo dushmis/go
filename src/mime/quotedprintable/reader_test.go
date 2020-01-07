@@ -30,14 +30,14 @@ func TestReader(t *testing.T) {
 		{in: "foo bar=3d", want: "foo bar="}, // lax.
 		{in: "foo bar=\n", want: "foo bar"},
 		{in: "foo bar\n", want: "foo bar\n"}, // somewhat lax.
-		{in: "foo bar=0", want: "foo bar", err: io.ErrUnexpectedEOF},
+		{in: "foo bar=0", want: "foo bar=0"}, // lax
 		{in: "foo bar=0D=0A", want: "foo bar\r\n"},
 		{in: " A B        \r\n C ", want: " A B\r\n C"},
 		{in: " A B =\r\n C ", want: " A B  C"},
 		{in: " A B =\n C ", want: " A B  C"}, // lax. treating LF as CRLF
 		{in: "foo=\nbar", want: "foobar"},
 		{in: "foo\x00bar", want: "foo", err: "quotedprintable: invalid unescaped byte 0x00 in body"},
-		{in: "foo bar\xff", want: "foo bar", err: "quotedprintable: invalid unescaped byte 0xff in body"},
+		{in: "foo bar\xff", want: "foo bar\xff"},
 
 		// Equal sign.
 		{in: "=3D30\n", want: "=30\n"},
@@ -65,6 +65,8 @@ func TestReader(t *testing.T) {
 		// Example from RFC 2045:
 		{in: "Now's the time =\n" + "for all folk to come=\n" + " to the aid of their country.",
 			want: "Now's the time for all folk to come to the aid of their country."},
+		{in: "accept UTF-8 right quotation mark: ’",
+			want: "accept UTF-8 right quotation mark: ’"},
 	}
 	for _, tt := range tests {
 		var buf bytes.Buffer
@@ -114,7 +116,11 @@ func TestExhaustive(t *testing.T) {
 
 	var buf bytes.Buffer
 	res := make(map[string]int)
-	everySequence("", "0A \r\n=", 6, func(s string) {
+	n := 6
+	if testing.Short() {
+		n = 4
+	}
+	everySequence("", "0A \r\n=", n, func(s string) {
 		if strings.HasSuffix(s, "=") || strings.Contains(s, "==") {
 			return
 		}
@@ -194,13 +200,17 @@ func TestExhaustive(t *testing.T) {
 	}
 	sort.Strings(outcomes)
 	got := strings.Join(outcomes, "\n")
-	want := `OK: 21576
-invalid bytes after =: 3397
-quotedprintable: invalid hex byte 0x0a: 1400
-quotedprintable: invalid hex byte 0x0d: 2700
-quotedprintable: invalid hex byte 0x20: 2490
-quotedprintable: invalid hex byte 0x3d: 440
-unexpected EOF: 3122`
+	want := `OK: 28934
+invalid bytes after =: 3949
+quotedprintable: invalid hex byte 0x0d: 2048
+unexpected EOF: 194`
+	if testing.Short() {
+		want = `OK: 896
+invalid bytes after =: 100
+quotedprintable: invalid hex byte 0x0d: 26
+unexpected EOF: 3`
+	}
+
 	if got != want {
 		t.Errorf("Got:\n%s\nWant:\n%s", got, want)
 	}

@@ -6,16 +6,27 @@ package net
 
 import (
 	"context"
+	"internal/syscall/windows"
 	"os"
 	"runtime"
 	"syscall"
 	"unsafe"
 )
 
+const _WSAHOST_NOT_FOUND = syscall.Errno(11001)
+
+func winError(call string, err error) error {
+	switch err {
+	case _WSAHOST_NOT_FOUND:
+		return errNoSuchHost
+	}
+	return os.NewSyscallError(call, err)
+}
+
 func getprotobyname(name string) (proto int, err error) {
 	p, err := syscall.GetProtoByName(name)
 	if err != nil {
-		return 0, os.NewSyscallError("getprotobyname", err)
+		return 0, winError("getprotobyname", err)
 	}
 	return int(p.Proto), nil
 }
@@ -46,7 +57,12 @@ func lookupProtocol(ctx context.Context, name string) (int, error) {
 			if proto, err := lookupProtocolMap(name); err == nil {
 				return proto, nil
 			}
-			r.err = &DNSError{Err: r.err.Error(), Name: name}
+
+			dnsError := &DNSError{Err: r.err.Error(), Name: name}
+			if r.err == errNoSuchHost {
+				dnsError.IsNotFound = true
+			}
+			r.err = dnsError
 		}
 		return r.proto, r.err
 	case <-ctx.Done():
@@ -54,8 +70,8 @@ func lookupProtocol(ctx context.Context, name string) (int, error) {
 	}
 }
 
-func lookupHost(ctx context.Context, name string) ([]string, error) {
-	ips, err := lookupIP(ctx, name)
+func (r *Resolver) lookupHost(ctx context.Context, name string) ([]string, error) {
+	ips, err := r.lookupIP(ctx, "ip", name)
 	if err != nil {
 		return nil, err
 	}
@@ -66,32 +82,38 @@ func lookupHost(ctx context.Context, name string) ([]string, error) {
 	return addrs, nil
 }
 
-// goLookupIP isn't a Pure Go implementation on Windows.
-// TODO(bradfitz): should it be? Not sure it can be. It's always used syscall.GetAddrInfoW.
-func goLookupIP(ctx context.Context, host string) (addrs []IPAddr, err error) {
-	return lookupIP(ctx, host)
-}
-
-func lookupIP(ctx context.Context, name string) ([]IPAddr, error) {
+func (r *Resolver) lookupIP(ctx context.Context, network, name string) ([]IPAddr, error) {
 	// TODO(bradfitz,brainman): use ctx more. See TODO below.
 
-	type ret struct {
-		addrs []IPAddr
-		err   error
+	var family int32 = syscall.AF_UNSPEC
+	switch ipVersion(network) {
+	case '4':
+		family = syscall.AF_INET
+	case '6':
+		family = syscall.AF_INET6
 	}
-	ch := make(chan ret, 1)
-	go func() {
+
+	getaddr := func() ([]IPAddr, error) {
 		acquireThread()
 		defer releaseThread()
 		hints := syscall.AddrinfoW{
-			Family:   syscall.AF_UNSPEC,
+			Family:   family,
 			Socktype: syscall.SOCK_STREAM,
 			Protocol: syscall.IPPROTO_IP,
 		}
 		var result *syscall.AddrinfoW
-		e := syscall.GetAddrInfoW(syscall.StringToUTF16Ptr(name), nil, &hints, &result)
+		name16p, err := syscall.UTF16PtrFromString(name)
+		if err != nil {
+			return nil, &DNSError{Name: name, Err: err.Error()}
+		}
+		e := syscall.GetAddrInfoW(name16p, nil, &hints, &result)
 		if e != nil {
-			ch <- ret{err: &DNSError{Err: os.NewSyscallError("getaddrinfow", e).Error(), Name: name}}
+			err := winError("getaddrinfow", e)
+			dnsError := &DNSError{Err: err.Error(), Name: name}
+			if err == errNoSuchHost {
+				dnsError.IsNotFound = true
+			}
+			return nil, dnsError
 		}
 		defer syscall.FreeAddrInfoW(result)
 		addrs := make([]IPAddr, 0, 5)
@@ -103,14 +125,29 @@ func lookupIP(ctx context.Context, name string) ([]IPAddr, error) {
 				addrs = append(addrs, IPAddr{IP: IPv4(a[0], a[1], a[2], a[3])})
 			case syscall.AF_INET6:
 				a := (*syscall.RawSockaddrInet6)(addr).Addr
-				zone := zoneToString(int((*syscall.RawSockaddrInet6)(addr).Scope_id))
+				zone := zoneCache.name(int((*syscall.RawSockaddrInet6)(addr).Scope_id))
 				addrs = append(addrs, IPAddr{IP: IP{a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15]}, Zone: zone})
 			default:
-				ch <- ret{err: &DNSError{Err: syscall.EWINDOWS.Error(), Name: name}}
+				return nil, &DNSError{Err: syscall.EWINDOWS.Error(), Name: name}
 			}
 		}
-		ch <- ret{addrs: addrs}
-	}()
+		return addrs, nil
+	}
+
+	type ret struct {
+		addrs []IPAddr
+		err   error
+	}
+
+	var ch chan ret
+	if ctx.Err() == nil {
+		ch = make(chan ret, 1)
+		go func() {
+			addr, err := getaddr()
+			ch <- ret{addrs: addr, err: err}
+		}()
+	}
+
 	select {
 	case r := <-ch:
 		return r.addrs, r.err
@@ -131,7 +168,11 @@ func lookupIP(ctx context.Context, name string) ([]IPAddr, error) {
 	}
 }
 
-func lookupPort(ctx context.Context, network, service string) (int, error) {
+func (r *Resolver) lookupPort(ctx context.Context, network, service string) (int, error) {
+	if r.preferGo() {
+		return lookupPortMap(network, service)
+	}
+
 	// TODO(bradfitz): finish ctx plumbing. Nothing currently depends on this.
 	acquireThread()
 	defer releaseThread()
@@ -153,7 +194,12 @@ func lookupPort(ctx context.Context, network, service string) (int, error) {
 		if port, err := lookupPortMap(network, service); err == nil {
 			return port, nil
 		}
-		return 0, &DNSError{Err: os.NewSyscallError("getaddrinfow", e).Error(), Name: network + "/" + service}
+		err := winError("getaddrinfow", e)
+		dnsError := &DNSError{Err: err.Error(), Name: network + "/" + service}
+		if err == errNoSuchHost {
+			dnsError.IsNotFound = true
+		}
+		return 0, dnsError
 	}
 	defer syscall.FreeAddrInfoW(result)
 	if result == nil {
@@ -171,7 +217,7 @@ func lookupPort(ctx context.Context, network, service string) (int, error) {
 	return 0, &DNSError{Err: syscall.EINVAL.Error(), Name: network + "/" + service}
 }
 
-func lookupCNAME(ctx context.Context, name string) (string, error) {
+func (*Resolver) lookupCNAME(ctx context.Context, name string) (string, error) {
 	// TODO(bradfitz): finish ctx plumbing. Nothing currently depends on this.
 	acquireThread()
 	defer releaseThread()
@@ -183,16 +229,16 @@ func lookupCNAME(ctx context.Context, name string) (string, error) {
 		return absDomainName([]byte(name)), nil
 	}
 	if e != nil {
-		return "", &DNSError{Err: os.NewSyscallError("dnsquery", e).Error(), Name: name}
+		return "", &DNSError{Err: winError("dnsquery", e).Error(), Name: name}
 	}
 	defer syscall.DnsRecordListFree(r, 1)
 
 	resolved := resolveCNAME(syscall.StringToUTF16Ptr(name), r)
-	cname := syscall.UTF16ToString((*[256]uint16)(unsafe.Pointer(resolved))[:])
+	cname := windows.UTF16PtrToString(resolved, 256)
 	return absDomainName([]byte(cname)), nil
 }
 
-func lookupSRV(ctx context.Context, service, proto, name string) (string, []*SRV, error) {
+func (*Resolver) lookupSRV(ctx context.Context, service, proto, name string) (string, []*SRV, error) {
 	// TODO(bradfitz): finish ctx plumbing. Nothing currently depends on this.
 	acquireThread()
 	defer releaseThread()
@@ -205,7 +251,7 @@ func lookupSRV(ctx context.Context, service, proto, name string) (string, []*SRV
 	var r *syscall.DNSRecord
 	e := syscall.DnsQuery(target, syscall.DNS_TYPE_SRV, 0, nil, &r, nil)
 	if e != nil {
-		return "", nil, &DNSError{Err: os.NewSyscallError("dnsquery", e).Error(), Name: target}
+		return "", nil, &DNSError{Err: winError("dnsquery", e).Error(), Name: target}
 	}
 	defer syscall.DnsRecordListFree(r, 1)
 
@@ -218,34 +264,34 @@ func lookupSRV(ctx context.Context, service, proto, name string) (string, []*SRV
 	return absDomainName([]byte(target)), srvs, nil
 }
 
-func lookupMX(ctx context.Context, name string) ([]*MX, error) {
+func (*Resolver) lookupMX(ctx context.Context, name string) ([]*MX, error) {
 	// TODO(bradfitz): finish ctx plumbing. Nothing currently depends on this.
 	acquireThread()
 	defer releaseThread()
 	var r *syscall.DNSRecord
 	e := syscall.DnsQuery(name, syscall.DNS_TYPE_MX, 0, nil, &r, nil)
 	if e != nil {
-		return nil, &DNSError{Err: os.NewSyscallError("dnsquery", e).Error(), Name: name}
+		return nil, &DNSError{Err: winError("dnsquery", e).Error(), Name: name}
 	}
 	defer syscall.DnsRecordListFree(r, 1)
 
 	mxs := make([]*MX, 0, 10)
 	for _, p := range validRecs(r, syscall.DNS_TYPE_MX, name) {
 		v := (*syscall.DNSMXData)(unsafe.Pointer(&p.Data[0]))
-		mxs = append(mxs, &MX{absDomainName([]byte(syscall.UTF16ToString((*[256]uint16)(unsafe.Pointer(v.NameExchange))[:]))), v.Preference})
+		mxs = append(mxs, &MX{absDomainName([]byte(windows.UTF16PtrToString(v.NameExchange, 256))), v.Preference})
 	}
 	byPref(mxs).sort()
 	return mxs, nil
 }
 
-func lookupNS(ctx context.Context, name string) ([]*NS, error) {
+func (*Resolver) lookupNS(ctx context.Context, name string) ([]*NS, error) {
 	// TODO(bradfitz): finish ctx plumbing. Nothing currently depends on this.
 	acquireThread()
 	defer releaseThread()
 	var r *syscall.DNSRecord
 	e := syscall.DnsQuery(name, syscall.DNS_TYPE_NS, 0, nil, &r, nil)
 	if e != nil {
-		return nil, &DNSError{Err: os.NewSyscallError("dnsquery", e).Error(), Name: name}
+		return nil, &DNSError{Err: winError("dnsquery", e).Error(), Name: name}
 	}
 	defer syscall.DnsRecordListFree(r, 1)
 
@@ -257,29 +303,30 @@ func lookupNS(ctx context.Context, name string) ([]*NS, error) {
 	return nss, nil
 }
 
-func lookupTXT(ctx context.Context, name string) ([]string, error) {
+func (*Resolver) lookupTXT(ctx context.Context, name string) ([]string, error) {
 	// TODO(bradfitz): finish ctx plumbing. Nothing currently depends on this.
 	acquireThread()
 	defer releaseThread()
 	var r *syscall.DNSRecord
 	e := syscall.DnsQuery(name, syscall.DNS_TYPE_TEXT, 0, nil, &r, nil)
 	if e != nil {
-		return nil, &DNSError{Err: os.NewSyscallError("dnsquery", e).Error(), Name: name}
+		return nil, &DNSError{Err: winError("dnsquery", e).Error(), Name: name}
 	}
 	defer syscall.DnsRecordListFree(r, 1)
 
 	txts := make([]string, 0, 10)
 	for _, p := range validRecs(r, syscall.DNS_TYPE_TEXT, name) {
 		d := (*syscall.DNSTXTData)(unsafe.Pointer(&p.Data[0]))
-		for _, v := range (*[1 << 10]*uint16)(unsafe.Pointer(&(d.StringArray[0])))[:d.StringCount] {
-			s := syscall.UTF16ToString((*[1 << 20]uint16)(unsafe.Pointer(v))[:])
-			txts = append(txts, s)
+		s := ""
+		for _, v := range (*[1 << 10]*uint16)(unsafe.Pointer(&(d.StringArray[0])))[:d.StringCount:d.StringCount] {
+			s += windows.UTF16PtrToString(v, 1<<20)
 		}
+		txts = append(txts, s)
 	}
 	return txts, nil
 }
 
-func lookupAddr(ctx context.Context, addr string) ([]string, error) {
+func (*Resolver) lookupAddr(ctx context.Context, addr string) ([]string, error) {
 	// TODO(bradfitz): finish ctx plumbing. Nothing currently depends on this.
 	acquireThread()
 	defer releaseThread()
@@ -290,14 +337,14 @@ func lookupAddr(ctx context.Context, addr string) ([]string, error) {
 	var r *syscall.DNSRecord
 	e := syscall.DnsQuery(arpa, syscall.DNS_TYPE_PTR, 0, nil, &r, nil)
 	if e != nil {
-		return nil, &DNSError{Err: os.NewSyscallError("dnsquery", e).Error(), Name: addr}
+		return nil, &DNSError{Err: winError("dnsquery", e).Error(), Name: addr}
 	}
 	defer syscall.DnsRecordListFree(r, 1)
 
 	ptrs := make([]string, 0, 10)
 	for _, p := range validRecs(r, syscall.DNS_TYPE_PTR, arpa) {
 		v := (*syscall.DNSPTRData)(unsafe.Pointer(&p.Data[0]))
-		ptrs = append(ptrs, absDomainName([]byte(syscall.UTF16ToString((*[256]uint16)(unsafe.Pointer(v.Host))[:]))))
+		ptrs = append(ptrs, absDomainName([]byte(windows.UTF16PtrToString(v.Host, 256))))
 	}
 	return ptrs, nil
 }
@@ -312,7 +359,8 @@ func validRecs(r *syscall.DNSRecord, dnstype uint16, name string) []*syscall.DNS
 	}
 	rec := make([]*syscall.DNSRecord, 0, 10)
 	for p := r; p != nil; p = p.Next {
-		if p.Dw&dnsSectionMask != syscall.DnsSectionAnswer {
+		// in case of a local machine, DNS records are returned with DNSREC_QUESTION flag instead of DNS_ANSWER
+		if p.Dw&dnsSectionMask != syscall.DnsSectionAnswer && p.Dw&dnsSectionMask != syscall.DnsSectionQuestion {
 			continue
 		}
 		if p.Type != dnstype {
@@ -328,7 +376,7 @@ func validRecs(r *syscall.DNSRecord, dnstype uint16, name string) []*syscall.DNS
 
 // returns the last CNAME in chain
 func resolveCNAME(name *uint16, r *syscall.DNSRecord) *uint16 {
-	// limit cname resolving to 10 in case of a infinite CNAME loop
+	// limit cname resolving to 10 in case of an infinite CNAME loop
 Cname:
 	for cnameloop := 0; cnameloop < 10; cnameloop++ {
 		for p := r; p != nil; p = p.Next {
@@ -347,4 +395,10 @@ Cname:
 		break
 	}
 	return name
+}
+
+// concurrentThreadsLimit returns the number of threads we permit to
+// run concurrently doing DNS lookups.
+func concurrentThreadsLimit() int {
+	return 500
 }

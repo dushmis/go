@@ -17,7 +17,7 @@ package cgotest
 static stack_t oss;
 static char signalStack[SIGSTKSZ];
 
-static void changeSignalStack() {
+static void changeSignalStack(void) {
 	stack_t ss;
 	memset(&ss, 0, sizeof ss);
 	ss.ss_sp = signalStack;
@@ -29,7 +29,7 @@ static void changeSignalStack() {
 	}
 }
 
-static void restoreSignalStack() {
+static void restoreSignalStack(void) {
 #if (defined(__x86_64__) || defined(__i386__)) && defined(__APPLE__)
 	// The Darwin C library enforces a minimum that the kernel does not.
 	// This is OK since we allocated this much space in mpreinit,
@@ -42,7 +42,7 @@ static void restoreSignalStack() {
 	}
 }
 
-static int zero() {
+static int zero(void) {
 	return 0;
 }
 */
@@ -55,7 +55,7 @@ import (
 
 func testSigaltstack(t *testing.T) {
 	switch {
-	case runtime.GOOS == "solaris", runtime.GOOS == "darwin" && (runtime.GOARCH == "arm" || runtime.GOARCH == "arm64"):
+	case runtime.GOOS == "solaris", runtime.GOOS == "illumos", runtime.GOOS == "darwin" && (runtime.GOARCH == "arm" || runtime.GOARCH == "arm64"):
 		t.Skipf("switching signal stack not implemented on %s/%s", runtime.GOOS, runtime.GOARCH)
 	case runtime.GOOS == "darwin" && runtime.GOARCH == "386":
 		t.Skipf("sigaltstack fails on darwin/386")

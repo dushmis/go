@@ -9,9 +9,13 @@ import (
 	"encoding/gob"
 	"encoding/json"
 	"fmt"
+	"internal/race"
 	"math/big"
 	"math/rand"
+	"os"
 	"runtime"
+	"strings"
+	"sync"
 	"testing"
 	"testing/quick"
 	. "time"
@@ -231,6 +235,7 @@ var truncateRoundTests = []struct {
 	{Date(-1, January, 1, 12, 15, 31, 5e8, UTC), 3},
 	{Date(2012, January, 1, 12, 15, 30, 5e8, UTC), Second},
 	{Date(2012, January, 1, 12, 15, 31, 5e8, UTC), Second},
+	{Unix(-19012425939, 649146258), 7435029458905025217}, // 5.8*d rounds to 6*d, but .8*d+.8*d < 0 < d
 }
 
 func TestTruncateRound(t *testing.T) {
@@ -517,13 +522,28 @@ var yearDayLocations = []*Location{
 }
 
 func TestYearDay(t *testing.T) {
-	for _, loc := range yearDayLocations {
+	for i, loc := range yearDayLocations {
 		for _, ydt := range yearDayTests {
 			dt := Date(ydt.year, Month(ydt.month), ydt.day, 0, 0, 0, 0, loc)
 			yday := dt.YearDay()
 			if yday != ydt.yday {
-				t.Errorf("got %d, expected %d for %d-%02d-%02d in %v",
-					yday, ydt.yday, ydt.year, ydt.month, ydt.day, loc)
+				t.Errorf("Date(%d-%02d-%02d in %v).YearDay() = %d, want %d",
+					ydt.year, ydt.month, ydt.day, loc, yday, ydt.yday)
+				continue
+			}
+
+			if ydt.year < 0 || ydt.year > 9999 {
+				continue
+			}
+			f := fmt.Sprintf("%04d-%02d-%02d %03d %+.2d00",
+				ydt.year, ydt.month, ydt.day, ydt.yday, (i-2)*4)
+			dt1, err := Parse("2006-01-02 002 -0700", f)
+			if err != nil {
+				t.Errorf(`Parse("2006-01-02 002 -0700", %q): %v`, f, err)
+				continue
+			}
+			if !dt1.Equal(dt) {
+				t.Errorf(`Parse("2006-01-02 002 -0700", %q) = %v, want %v`, f, dt1, dt)
 			}
 		}
 	}
@@ -572,6 +592,7 @@ var dateTests = []struct {
 	{2011, 3, 13, 1, 59, 59, 0, Local, 1300010399}, // 1:59:59 PST
 	{2011, 3, 13, 3, 0, 0, 0, Local, 1300010400},   // 3:00:00 PDT
 	{2011, 3, 13, 2, 30, 0, 0, Local, 1300008600},  // 2:30:00 PDT ≡ 1:30 PST
+	{2012, 12, 24, 0, 0, 0, 0, Local, 1356336000},  // Leap year
 
 	// Many names for Fri Nov 18 7:56:35 PST 2011
 	{2011, 11, 18, 7, 56, 35, 0, Local, 1321631795},                 // Nov 18 7:56:35
@@ -669,7 +690,7 @@ var gobTests = []Time{
 	Date(0, 1, 2, 3, 4, 5, 6, UTC),
 	Date(7, 8, 9, 10, 11, 12, 13, FixedZone("", 0)),
 	Unix(81985467080890095, 0x76543210), // Time.sec: 0x0123456789ABCDEF
-	{}, // nil location
+	{},                                  // nil location
 	Date(1, 2, 3, 4, 5, 6, 7, FixedZone("", 32767*60)),
 	Date(1, 2, 3, 4, 5, 6, 7, FixedZone("", -32768*60)),
 }
@@ -974,6 +995,9 @@ var subTests = []struct {
 	{Date(2300, 1, 1, 0, 0, 0, 0, UTC), Date(2000, 1, 1, 0, 0, 0, 0, UTC), Duration(maxDuration)},
 	{Date(2000, 1, 1, 0, 0, 0, 0, UTC), Date(2290, 1, 1, 0, 0, 0, 0, UTC), -290*365*24*Hour - 71*24*Hour},
 	{Date(2000, 1, 1, 0, 0, 0, 0, UTC), Date(2300, 1, 1, 0, 0, 0, 0, UTC), Duration(minDuration)},
+	{Date(2311, 11, 26, 02, 16, 47, 63535996, UTC), Date(2019, 8, 16, 2, 29, 30, 268436582, UTC), 9223372036795099414},
+	{MinMonoTime, MaxMonoTime, minDuration},
+	{MaxMonoTime, MinMonoTime, maxDuration},
 }
 
 func TestSub(t *testing.T) {
@@ -998,7 +1022,54 @@ var nsDurationTests = []struct {
 func TestDurationNanoseconds(t *testing.T) {
 	for _, tt := range nsDurationTests {
 		if got := tt.d.Nanoseconds(); got != tt.want {
-			t.Errorf("d.Nanoseconds() = %d; want: %d", got, tt.want)
+			t.Errorf("Duration(%s).Nanoseconds() = %d; want: %d", tt.d, got, tt.want)
+		}
+	}
+}
+
+var usDurationTests = []struct {
+	d    Duration
+	want int64
+}{
+	{Duration(-1000), -1},
+	{Duration(1000), 1},
+}
+
+func TestDurationMicroseconds(t *testing.T) {
+	for _, tt := range usDurationTests {
+		if got := tt.d.Microseconds(); got != tt.want {
+			t.Errorf("Duration(%s).Microseconds() = %d; want: %d", tt.d, got, tt.want)
+		}
+	}
+}
+
+var msDurationTests = []struct {
+	d    Duration
+	want int64
+}{
+	{Duration(-1000000), -1},
+	{Duration(1000000), 1},
+}
+
+func TestDurationMilliseconds(t *testing.T) {
+	for _, tt := range msDurationTests {
+		if got := tt.d.Milliseconds(); got != tt.want {
+			t.Errorf("Duration(%s).Milliseconds() = %d; want: %d", tt.d, got, tt.want)
+		}
+	}
+}
+
+var secDurationTests = []struct {
+	d    Duration
+	want float64
+}{
+	{Duration(300000000), 0.3},
+}
+
+func TestDurationSeconds(t *testing.T) {
+	for _, tt := range secDurationTests {
+		if got := tt.d.Seconds(); got != tt.want {
+			t.Errorf("Duration(%s).Seconds() = %g; want: %g", tt.d, got, tt.want)
 		}
 	}
 }
@@ -1011,12 +1082,13 @@ var minDurationTests = []struct {
 	{Duration(-1), -1 / 60e9},
 	{Duration(1), 1 / 60e9},
 	{Duration(60000000000), 1},
+	{Duration(3000), 5e-8},
 }
 
 func TestDurationMinutes(t *testing.T) {
 	for _, tt := range minDurationTests {
 		if got := tt.d.Minutes(); got != tt.want {
-			t.Errorf("d.Minutes() = %g; want: %g", got, tt.want)
+			t.Errorf("Duration(%s).Minutes() = %g; want: %g", tt.d, got, tt.want)
 		}
 	}
 }
@@ -1029,12 +1101,73 @@ var hourDurationTests = []struct {
 	{Duration(-1), -1 / 3600e9},
 	{Duration(1), 1 / 3600e9},
 	{Duration(3600000000000), 1},
+	{Duration(36), 1e-11},
 }
 
 func TestDurationHours(t *testing.T) {
 	for _, tt := range hourDurationTests {
 		if got := tt.d.Hours(); got != tt.want {
-			t.Errorf("d.Hours() = %g; want: %g", got, tt.want)
+			t.Errorf("Duration(%s).Hours() = %g; want: %g", tt.d, got, tt.want)
+		}
+	}
+}
+
+var durationTruncateTests = []struct {
+	d    Duration
+	m    Duration
+	want Duration
+}{
+	{0, Second, 0},
+	{Minute, -7 * Second, Minute},
+	{Minute, 0, Minute},
+	{Minute, 1, Minute},
+	{Minute + 10*Second, 10 * Second, Minute + 10*Second},
+	{2*Minute + 10*Second, Minute, 2 * Minute},
+	{10*Minute + 10*Second, 3 * Minute, 9 * Minute},
+	{Minute + 10*Second, Minute + 10*Second + 1, 0},
+	{Minute + 10*Second, Hour, 0},
+	{-Minute, Second, -Minute},
+	{-10 * Minute, 3 * Minute, -9 * Minute},
+	{-10 * Minute, Hour, 0},
+}
+
+func TestDurationTruncate(t *testing.T) {
+	for _, tt := range durationTruncateTests {
+		if got := tt.d.Truncate(tt.m); got != tt.want {
+			t.Errorf("Duration(%s).Truncate(%s) = %s; want: %s", tt.d, tt.m, got, tt.want)
+		}
+	}
+}
+
+var durationRoundTests = []struct {
+	d    Duration
+	m    Duration
+	want Duration
+}{
+	{0, Second, 0},
+	{Minute, -11 * Second, Minute},
+	{Minute, 0, Minute},
+	{Minute, 1, Minute},
+	{2 * Minute, Minute, 2 * Minute},
+	{2*Minute + 10*Second, Minute, 2 * Minute},
+	{2*Minute + 30*Second, Minute, 3 * Minute},
+	{2*Minute + 50*Second, Minute, 3 * Minute},
+	{-Minute, 1, -Minute},
+	{-2 * Minute, Minute, -2 * Minute},
+	{-2*Minute - 10*Second, Minute, -2 * Minute},
+	{-2*Minute - 30*Second, Minute, -3 * Minute},
+	{-2*Minute - 50*Second, Minute, -3 * Minute},
+	{8e18, 3e18, 9e18},
+	{9e18, 5e18, 1<<63 - 1},
+	{-8e18, 3e18, -9e18},
+	{-9e18, 5e18, -1 << 63},
+	{3<<61 - 1, 3 << 61, 3 << 61},
+}
+
+func TestDurationRound(t *testing.T) {
+	for _, tt := range durationRoundTests {
+		if got := tt.d.Round(tt.m); got != tt.want {
+			t.Errorf("Duration(%s).Round(%s) = %s; want: %s", tt.d, tt.m, got, tt.want)
 		}
 	}
 }
@@ -1117,16 +1250,18 @@ var defaultLocTests = []struct {
 
 	{"Truncate", func(t1, t2 Time) bool { return t1.Truncate(Hour).Equal(t2.Truncate(Hour)) }},
 	{"Round", func(t1, t2 Time) bool { return t1.Round(Hour).Equal(t2.Round(Hour)) }},
+
+	{"== Time{}", func(t1, t2 Time) bool { return (t1 == Time{}) == (t2 == Time{}) }},
 }
 
 func TestDefaultLoc(t *testing.T) {
-	//This test verifyes that all Time's methods behaves identical if loc is set
-	//as nil or UTC
+	// Verify that all of Time's methods behave identically if loc is set to
+	// nil or UTC.
 	for _, tt := range defaultLocTests {
 		t1 := Time{}
 		t2 := Time{}.UTC()
 		if !tt.f(t1, t2) {
-			t.Errorf("Default fail on fuction: %s", tt.name)
+			t.Errorf("Time{} and Time{}.UTC() behave differently for %s", tt.name)
 		}
 	}
 }
@@ -1212,4 +1347,82 @@ func BenchmarkDay(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		_ = t.Day()
 	}
+}
+
+func TestMarshalBinaryZeroTime(t *testing.T) {
+	t0 := Time{}
+	enc, err := t0.MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t1 := Now() // not zero
+	if err := t1.UnmarshalBinary(enc); err != nil {
+		t.Fatal(err)
+	}
+	if t1 != t0 {
+		t.Errorf("t0=%#v\nt1=%#v\nwant identical structures", t0, t1)
+	}
+}
+
+// Issue 17720: Zero value of time.Month fails to print
+func TestZeroMonthString(t *testing.T) {
+	if got, want := Month(0).String(), "%!Month(0)"; got != want {
+		t.Errorf("zero month = %q; want %q", got, want)
+	}
+}
+
+// Issue 24692: Out of range weekday panics
+func TestWeekdayString(t *testing.T) {
+	if got, want := Weekday(Tuesday).String(), "Tuesday"; got != want {
+		t.Errorf("Tuesday weekday = %q; want %q", got, want)
+	}
+	if got, want := Weekday(14).String(), "%!Weekday(14)"; got != want {
+		t.Errorf("14th weekday = %q; want %q", got, want)
+	}
+}
+
+func TestReadFileLimit(t *testing.T) {
+	const zero = "/dev/zero"
+	if _, err := os.Stat(zero); err != nil {
+		t.Skip("skipping test without a /dev/zero")
+	}
+	_, err := ReadFile(zero)
+	if err == nil || !strings.Contains(err.Error(), "is too large") {
+		t.Errorf("readFile(%q) error = %v; want error containing 'is too large'", zero, err)
+	}
+}
+
+// Issue 25686: hard crash on concurrent timer access.
+// This test deliberately invokes a race condition.
+// We are testing that we don't crash with "fatal error: panic holding locks".
+func TestConcurrentTimerReset(t *testing.T) {
+	if race.Enabled {
+		t.Skip("skipping test under race detector")
+	}
+
+	// We expect this code to panic rather than crash.
+	// Don't worry if it doesn't panic.
+	catch := func(i int) {
+		if e := recover(); e != nil {
+			t.Logf("panic in goroutine %d, as expected, with %q", i, e)
+		} else {
+			t.Logf("no panic in goroutine %d", i)
+		}
+	}
+
+	const goroutines = 8
+	const tries = 1000
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	timer := NewTimer(Hour)
+	for i := 0; i < goroutines; i++ {
+		go func(i int) {
+			defer wg.Done()
+			defer catch(i)
+			for j := 0; j < tries; j++ {
+				timer.Reset(Hour + Duration(i*j))
+			}
+		}(i)
+	}
+	wg.Wait()
 }

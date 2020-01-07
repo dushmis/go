@@ -105,7 +105,7 @@ never read data
 
 useless trailer
 `
-	testBody = strings.Replace(testBody, "\n", sep, -1)
+	testBody = strings.ReplaceAll(testBody, "\n", sep)
 	return strings.Replace(testBody, "[longline]", longLine, 1)
 }
 
@@ -125,6 +125,7 @@ func TestMultipartSlowInput(t *testing.T) {
 }
 
 func testMultipart(t *testing.T, r io.Reader, onlyNewlines bool) {
+	t.Parallel()
 	reader := NewReader(r, "MyBoundary")
 	buf := new(bytes.Buffer)
 
@@ -150,7 +151,7 @@ func testMultipart(t *testing.T, r io.Reader, onlyNewlines bool) {
 
 	adjustNewlines := func(s string) string {
 		if onlyNewlines {
-			return strings.Replace(s, "\r\n", "\n", -1)
+			return strings.ReplaceAll(s, "\r\n", "\n")
 		}
 		return s
 	}
@@ -298,7 +299,7 @@ foo-bar: baz
 
 Oh no, premature EOF!
 `
-	body := strings.Replace(testBody, "\n", "\r\n", -1)
+	body := strings.ReplaceAll(testBody, "\n", "\r\n")
 	bodyReader := strings.NewReader(body)
 	r := NewReader(bodyReader, "MyBoundary")
 
@@ -321,6 +322,73 @@ func (s *slowReader) Read(p []byte) (int, error) {
 		return s.r.Read(p)
 	}
 	return s.r.Read(p[:1])
+}
+
+type sentinelReader struct {
+	// done is closed when this reader is read from.
+	done chan struct{}
+}
+
+func (s *sentinelReader) Read([]byte) (int, error) {
+	if s.done != nil {
+		close(s.done)
+		s.done = nil
+	}
+	return 0, io.EOF
+}
+
+// TestMultipartStreamReadahead tests that PartReader does not block
+// on reading past the end of a part, ensuring that it can be used on
+// a stream like multipart/x-mixed-replace. See golang.org/issue/15431
+func TestMultipartStreamReadahead(t *testing.T) {
+	testBody1 := `
+This is a multi-part message.  This line is ignored.
+--MyBoundary
+foo-bar: baz
+
+Body
+--MyBoundary
+`
+	testBody2 := `foo-bar: bop
+
+Body 2
+--MyBoundary--
+`
+	done1 := make(chan struct{})
+	reader := NewReader(
+		io.MultiReader(
+			strings.NewReader(testBody1),
+			&sentinelReader{done1},
+			strings.NewReader(testBody2)),
+		"MyBoundary")
+
+	var i int
+	readPart := func(hdr textproto.MIMEHeader, body string) {
+		part, err := reader.NextPart()
+		if part == nil || err != nil {
+			t.Fatalf("Part %d: NextPart failed: %v", i, err)
+		}
+
+		if !reflect.DeepEqual(part.Header, hdr) {
+			t.Errorf("Part %d: part.Header = %v, want %v", i, part.Header, hdr)
+		}
+		data, err := ioutil.ReadAll(part)
+		expectEq(t, body, string(data), fmt.Sprintf("Part %d body", i))
+		if err != nil {
+			t.Fatalf("Part %d: ReadAll failed: %v", i, err)
+		}
+		i++
+	}
+
+	readPart(textproto.MIMEHeader{"Foo-Bar": {"baz"}}, "Body")
+
+	select {
+	case <-done1:
+		t.Errorf("Reader read past second boundary")
+	default:
+	}
+
+	readPart(textproto.MIMEHeader{"Foo-Bar": {"bop"}}, "Body 2")
 }
 
 func TestLineContinuation(t *testing.T) {
@@ -351,8 +419,16 @@ func TestLineContinuation(t *testing.T) {
 }
 
 func TestQuotedPrintableEncoding(t *testing.T) {
+	for _, cte := range []string{"quoted-printable", "Quoted-PRINTABLE"} {
+		t.Run(cte, func(t *testing.T) {
+			testQuotedPrintableEncoding(t, cte)
+		})
+	}
+}
+
+func testQuotedPrintableEncoding(t *testing.T, cte string) {
 	// From https://golang.org/issue/4411
-	body := "--0016e68ee29c5d515f04cedf6733\r\nContent-Type: text/plain; charset=ISO-8859-1\r\nContent-Disposition: form-data; name=text\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\nwords words words words words words words words words words words words wor=\r\nds words words words words words words words words words words words words =\r\nwords words words words words words words words words words words words wor=\r\nds words words words words words words words words words words words words =\r\nwords words words words words words words words words\r\n--0016e68ee29c5d515f04cedf6733\r\nContent-Type: text/plain; charset=ISO-8859-1\r\nContent-Disposition: form-data; name=submit\r\n\r\nSubmit\r\n--0016e68ee29c5d515f04cedf6733--"
+	body := "--0016e68ee29c5d515f04cedf6733\r\nContent-Type: text/plain; charset=ISO-8859-1\r\nContent-Disposition: form-data; name=text\r\nContent-Transfer-Encoding: " + cte + "\r\n\r\nwords words words words words words words words words words words words wor=\r\nds words words words words words words words words words words words words =\r\nwords words words words words words words words words words words words wor=\r\nds words words words words words words words words words words words words =\r\nwords words words words words words words words words\r\n--0016e68ee29c5d515f04cedf6733\r\nContent-Type: text/plain; charset=ISO-8859-1\r\nContent-Disposition: form-data; name=submit\r\n\r\nSubmit\r\n--0016e68ee29c5d515f04cedf6733--"
 	r := NewReader(strings.NewReader(body), "0016e68ee29c5d515f04cedf6733")
 	part, err := r.NextPart()
 	if err != nil {
@@ -368,6 +444,66 @@ func TestQuotedPrintableEncoding(t *testing.T) {
 	}
 	got := buf.String()
 	want := "words words words words words words words words words words words words words words words words words words words words words words words words words words words words words words words words words words words words words words words words words words words words words words words words words words words words words words words words words words words"
+	if got != want {
+		t.Errorf("wrong part value:\n got: %q\nwant: %q", got, want)
+	}
+}
+
+func TestRawPart(t *testing.T) {
+	// https://github.com/golang/go/issues/29090
+
+	body := strings.Replace(`--0016e68ee29c5d515f04cedf6733
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: quoted-printable
+
+<div dir=3D"ltr">Hello World.</div>
+--0016e68ee29c5d515f04cedf6733
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: quoted-printable
+
+<div dir=3D"ltr">Hello World.</div>
+--0016e68ee29c5d515f04cedf6733--`, "\n", "\r\n", -1)
+
+	r := NewReader(strings.NewReader(body), "0016e68ee29c5d515f04cedf6733")
+
+	// This part is expected to be raw, bypassing the automatic handling
+	// of quoted-printable.
+	part, err := r.NextRawPart()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := part.Header["Content-Transfer-Encoding"]; !ok {
+		t.Errorf("missing Content-Transfer-Encoding")
+	}
+	var buf bytes.Buffer
+	_, err = io.Copy(&buf, part)
+	if err != nil {
+		t.Error(err)
+	}
+	got := buf.String()
+	// Data is still quoted-printable.
+	want := `<div dir=3D"ltr">Hello World.</div>`
+	if got != want {
+		t.Errorf("wrong part value:\n got: %q\nwant: %q", got, want)
+	}
+
+	// This part is expected to have automatic decoding of quoted-printable.
+	part, err = r.NextPart()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if te, ok := part.Header["Content-Transfer-Encoding"]; ok {
+		t.Errorf("unexpected Content-Transfer-Encoding of %q", te)
+	}
+
+	buf.Reset()
+	_, err = io.Copy(&buf, part)
+	if err != nil {
+		t.Error(err)
+	}
+	got = buf.String()
+	// QP data has been decoded.
+	want = `<div dir="ltr">Hello World.</div>`
 	if got != want {
 		t.Errorf("wrong part value:\n got: %q\nwant: %q", got, want)
 	}
@@ -755,7 +891,11 @@ func partsFromReader(r *Reader) ([]headerBody, error) {
 }
 
 func TestParseAllSizes(t *testing.T) {
-	const maxSize = 5 << 10
+	t.Parallel()
+	maxSize := 5 << 10
+	if testing.Short() {
+		maxSize = 512
+	}
 	var buf bytes.Buffer
 	body := strings.Repeat("a", maxSize)
 	bodyb := []byte(body)
@@ -810,4 +950,12 @@ func roundTripParseTest() parseTest {
 	t.in = buf.String()
 	t.sep = w.Boundary()
 	return t
+}
+
+func TestNoBoundary(t *testing.T) {
+	mr := NewReader(strings.NewReader(""), "")
+	_, err := mr.NextPart()
+	if got, want := fmt.Sprint(err), "multipart: boundary is empty"; got != want {
+		t.Errorf("NextPart error = %v; want %v", got, want)
+	}
 }

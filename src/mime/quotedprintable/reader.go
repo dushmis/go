@@ -77,6 +77,8 @@ func (r *Reader) Read(p []byte) (n int, err error) {
 	// 3. it accepts soft line-break (=) at end of message (issue 15486); i.e.
 	//    the final byte read from the underlying reader is allowed to be '=',
 	//    and it will be silently ignored.
+	// 4. it takes = as literal = if not followed by two hex digits
+	//    but not at end of line (issue 13219).
 	for len(p) > 0 {
 		if len(r.line) == 0 {
 			if r.rerr != nil {
@@ -111,10 +113,19 @@ func (r *Reader) Read(p []byte) (n int, err error) {
 		case b == '=':
 			b, err = readHexByte(r.line[1:])
 			if err != nil {
+				if len(r.line) >= 2 && r.line[1] != '\r' && r.line[1] != '\n' {
+					// Take the = as a literal =.
+					b = '='
+					break
+				}
 				return n, err
 			}
 			r.line = r.line[2:] // 2 of the 3; other 1 is done below
 		case b == '\t' || b == '\r' || b == '\n':
+			break
+		case b >= 0x80:
+			// As an extension to RFC 2045, we accept
+			// values >= 0x80 without complaint. Issue 22597.
 			break
 		case b < ' ' || b > '~':
 			return n, fmt.Errorf("quotedprintable: invalid unescaped byte 0x%02x in body", b)

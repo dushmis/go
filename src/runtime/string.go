@@ -4,7 +4,10 @@
 
 package runtime
 
-import "unsafe"
+import (
+	"internal/bytealg"
+	"unsafe"
+)
 
 // The constant is known to the compiler.
 // There is no fundamental theory behind this number.
@@ -69,7 +72,7 @@ func concatstring5(buf *tmpBuf, a [5]string) string {
 
 // Buf is a fixed-size buffer for the result,
 // it is not nil if the result does not escape.
-func slicebytetostring(buf *tmpBuf, b []byte) string {
+func slicebytetostring(buf *tmpBuf, b []byte) (str string) {
 	l := len(b)
 	if l == 0 {
 		// Turns out to be a relatively common case.
@@ -77,18 +80,31 @@ func slicebytetostring(buf *tmpBuf, b []byte) string {
 		// you find the indices and convert the subslice to string.
 		return ""
 	}
-	if raceenabled && l > 0 {
+	if raceenabled {
 		racereadrangepc(unsafe.Pointer(&b[0]),
 			uintptr(l),
-			getcallerpc(unsafe.Pointer(&buf)),
+			getcallerpc(),
 			funcPC(slicebytetostring))
 	}
-	if msanenabled && l > 0 {
+	if msanenabled {
 		msanread(unsafe.Pointer(&b[0]), uintptr(l))
 	}
-	s, c := rawstringtmp(buf, l)
-	copy(c, b)
-	return s
+	if l == 1 {
+		stringStructOf(&str).str = unsafe.Pointer(&staticbytes[b[0]])
+		stringStructOf(&str).len = 1
+		return
+	}
+
+	var p unsafe.Pointer
+	if buf != nil && len(b) <= len(buf) {
+		p = unsafe.Pointer(buf)
+	} else {
+		p = mallocgc(uintptr(len(b)), nil, false)
+	}
+	stringStructOf(&str).str = p
+	stringStructOf(&str).len = len(b)
+	memmove(p, (*(*slice)(unsafe.Pointer(&b))).array, uintptr(len(b)))
+	return
 }
 
 // stringDataOnStack reports whether the string's data is
@@ -119,14 +135,15 @@ func rawstringtmp(buf *tmpBuf, l int) (s string, b []byte) {
 // and otherwise intrinsified by the compiler.
 //
 // Some internal compiler optimizations use this function.
-// - Used for m[string(k)] lookup where m is a string-keyed map and k is a []byte.
+// - Used for m[T1{... Tn{..., string(k), ...} ...}] and m[string(k)]
+//   where k is []byte, T1 to Tn is a nesting of struct and array literals.
 // - Used for "<"+string(b)+">" concatenation where b is []byte.
 // - Used for string(b)=="foo" comparison where b is []byte.
 func slicebytetostringtmp(b []byte) string {
 	if raceenabled && len(b) > 0 {
 		racereadrangepc(unsafe.Pointer(&b[0]),
 			uintptr(len(b)),
-			getcallerpc(unsafe.Pointer(&b)),
+			getcallerpc(),
 			funcPC(slicebytetostringtmp))
 	}
 	if msanenabled && len(b) > 0 {
@@ -145,18 +162,6 @@ func stringtoslicebyte(buf *tmpBuf, s string) []byte {
 	}
 	copy(b, s)
 	return b
-}
-
-func stringtoslicebytetmp(s string) []byte {
-	// Return a slice referring to the actual string bytes.
-	// This is only for use by internal compiler optimizations
-	// that know that the slice won't be mutated.
-	// The only such case today is:
-	// for i, c := range []byte(str)
-
-	str := stringStructOf(&s)
-	ret := slice{array: str.str, len: str.len, cap: str.len}
-	return *(*[]byte)(unsafe.Pointer(&ret))
 }
 
 func stringtoslicerune(buf *[tmpStringBufSize]rune, s string) []rune {
@@ -187,7 +192,7 @@ func slicerunetostring(buf *tmpBuf, a []rune) string {
 	if raceenabled && len(a) > 0 {
 		racereadrangepc(unsafe.Pointer(&a[0]),
 			uintptr(len(a))*unsafe.Sizeof(a[0]),
-			getcallerpc(unsafe.Pointer(&buf)),
+			getcallerpc(),
 			funcPC(slicerunetostring))
 	}
 	if msanenabled && len(a) > 0 {
@@ -196,7 +201,7 @@ func slicerunetostring(buf *tmpBuf, a []rune) string {
 	var dum [4]byte
 	size1 := 0
 	for _, r := range a {
-		size1 += runetochar(dum[:], r)
+		size1 += encoderune(dum[:], r)
 	}
 	s, b := rawstringtmp(buf, size1+3)
 	size2 := 0
@@ -205,7 +210,7 @@ func slicerunetostring(buf *tmpBuf, a []rune) string {
 		if size2 >= size1 {
 			break
 		}
-		size2 += runetochar(b[size2:], r)
+		size2 += encoderune(b[size2:], r)
 	}
 	return s[:size2]
 }
@@ -225,8 +230,13 @@ func stringStructOf(sp *string) *stringStruct {
 	return (*stringStruct)(unsafe.Pointer(sp))
 }
 
-func intstring(buf *[4]byte, v int64) string {
-	var s string
+func intstring(buf *[4]byte, v int64) (s string) {
+	if v >= 0 && v < runeSelf {
+		stringStructOf(&s).str = unsafe.Pointer(&staticbytes[v])
+		stringStructOf(&s).len = 1
+		return
+	}
+
 	var b []byte
 	if buf != nil {
 		b = buf[:]
@@ -235,9 +245,9 @@ func intstring(buf *[4]byte, v int64) string {
 		s, b = rawstring(4)
 	}
 	if int64(rune(v)) != v {
-		v = runeerror
+		v = runeError
 	}
-	n := runetochar(b, rune(v))
+	n := encoderune(b, rune(v))
 	return s[:n]
 }
 
@@ -261,7 +271,7 @@ func rawbyteslice(size int) (b []byte) {
 	cap := roundupsize(uintptr(size))
 	p := mallocgc(cap, nil, false)
 	if cap != uintptr(size) {
-		memclr(add(p, uintptr(size)), cap-uintptr(size))
+		memclrNoHeapPointers(add(p, uintptr(size)), cap-uintptr(size))
 	}
 
 	*(*slice)(unsafe.Pointer(&b)) = slice{p, size, int(cap)}
@@ -270,13 +280,13 @@ func rawbyteslice(size int) (b []byte) {
 
 // rawruneslice allocates a new rune slice. The rune slice is not zeroed.
 func rawruneslice(size int) (b []rune) {
-	if uintptr(size) > _MaxMem/4 {
+	if uintptr(size) > maxAlloc/4 {
 		throw("out of memory")
 	}
 	mem := roundupsize(uintptr(size) * 4)
 	p := mallocgc(mem, nil, false)
 	if mem != uintptr(size)*4 {
-		memclr(add(p, uintptr(size)*4), mem-uintptr(size)*4)
+		memclrNoHeapPointers(add(p, uintptr(size)*4), mem-uintptr(size)*4)
 	}
 
 	*(*slice)(unsafe.Pointer(&b)) = slice{p, size, int(mem / 4)}
@@ -284,15 +294,24 @@ func rawruneslice(size int) (b []rune) {
 }
 
 // used by cmd/cgo
-func gobytes(p *byte, n int) []byte {
+func gobytes(p *byte, n int) (b []byte) {
 	if n == 0 {
 		return make([]byte, 0)
 	}
-	x := make([]byte, n)
-	memmove(unsafe.Pointer(&x[0]), unsafe.Pointer(p), uintptr(n))
-	return x
+
+	if n < 0 || uintptr(n) > maxAlloc {
+		panic(errorString("gobytes: length out of range"))
+	}
+
+	bp := mallocgc(uintptr(n), nil, false)
+	memmove(bp, unsafe.Pointer(p), uintptr(n))
+
+	*(*slice)(unsafe.Pointer(&b)) = slice{bp, n, n}
+	return
 }
 
+// This is exported via linkname to assembly in syscall (for Plan9).
+//go:linkname gostring
 func gostring(p *byte) string {
 	l := findnull(p)
 	if l == 0 {
@@ -317,7 +336,7 @@ func index(s, t string) int {
 		return 0
 	}
 	for i := 0; i < len(s); i++ {
-		if s[i] == t[0] && hasprefix(s[i:], t) {
+		if s[i] == t[0] && hasPrefix(s[i:], t) {
 			return i
 		}
 	}
@@ -328,17 +347,70 @@ func contains(s, t string) bool {
 	return index(s, t) >= 0
 }
 
-func hasprefix(s, t string) bool {
-	return len(s) >= len(t) && s[:len(t)] == t
+func hasPrefix(s, prefix string) bool {
+	return len(s) >= len(prefix) && s[:len(prefix)] == prefix
 }
 
-func atoi(s string) int {
-	n := 0
-	for len(s) > 0 && '0' <= s[0] && s[0] <= '9' {
-		n = n*10 + int(s[0]) - '0'
+const (
+	maxUint = ^uint(0)
+	maxInt  = int(maxUint >> 1)
+)
+
+// atoi parses an int from a string s.
+// The bool result reports whether s is a number
+// representable by a value of type int.
+func atoi(s string) (int, bool) {
+	if s == "" {
+		return 0, false
+	}
+
+	neg := false
+	if s[0] == '-' {
+		neg = true
 		s = s[1:]
 	}
-	return n
+
+	un := uint(0)
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+		if un > maxUint/10 {
+			// overflow
+			return 0, false
+		}
+		un *= 10
+		un1 := un + uint(c) - '0'
+		if un1 < un {
+			// overflow
+			return 0, false
+		}
+		un = un1
+	}
+
+	if !neg && un > uint(maxInt) {
+		return 0, false
+	}
+	if neg && un > uint(maxInt)+1 {
+		return 0, false
+	}
+
+	n := int(un)
+	if neg {
+		n = -n
+	}
+
+	return n, true
+}
+
+// atoi32 is like atoi but for integers
+// that fit into an int32.
+func atoi32(s string) (int32, bool) {
+	if n, ok := atoi(s); n == int(int32(n)) {
+		return int32(n), ok
+	}
+	return 0, false
 }
 
 //go:nosplit
@@ -346,19 +418,50 @@ func findnull(s *byte) int {
 	if s == nil {
 		return 0
 	}
-	p := (*[_MaxMem/2 - 1]byte)(unsafe.Pointer(s))
-	l := 0
-	for p[l] != 0 {
-		l++
+
+	// Avoid IndexByteString on Plan 9 because it uses SSE instructions
+	// on x86 machines, and those are classified as floating point instructions,
+	// which are illegal in a note handler.
+	if GOOS == "plan9" {
+		p := (*[maxAlloc/2 - 1]byte)(unsafe.Pointer(s))
+		l := 0
+		for p[l] != 0 {
+			l++
+		}
+		return l
 	}
-	return l
+
+	// pageSize is the unit we scan at a time looking for NULL.
+	// It must be the minimum page size for any architecture Go
+	// runs on. It's okay (just a minor performance loss) if the
+	// actual system page size is larger than this value.
+	const pageSize = 4096
+
+	offset := 0
+	ptr := unsafe.Pointer(s)
+	// IndexByteString uses wide reads, so we need to be careful
+	// with page boundaries. Call IndexByteString on
+	// [ptr, endOfPage) interval.
+	safeLen := int(pageSize - uintptr(ptr)%pageSize)
+
+	for {
+		t := *(*string)(unsafe.Pointer(&stringStruct{ptr, safeLen}))
+		// Check one page at a time.
+		if i := bytealg.IndexByteString(t, 0); i != -1 {
+			return offset + i
+		}
+		// Move to next page
+		ptr = unsafe.Pointer(uintptr(ptr) + uintptr(safeLen))
+		offset += safeLen
+		safeLen = pageSize
+	}
 }
 
 func findnullw(s *uint16) int {
 	if s == nil {
 		return 0
 	}
-	p := (*[_MaxMem/2/2 - 1]uint16)(unsafe.Pointer(s))
+	p := (*[maxAlloc/2/2 - 1]uint16)(unsafe.Pointer(s))
 	l := 0
 	for p[l] != 0 {
 		l++
@@ -375,10 +478,10 @@ func gostringnocopy(str *byte) string {
 
 func gostringw(strw *uint16) string {
 	var buf [8]byte
-	str := (*[_MaxMem/2/2 - 1]uint16)(unsafe.Pointer(strw))
+	str := (*[maxAlloc/2/2 - 1]uint16)(unsafe.Pointer(strw))
 	n1 := 0
 	for i := 0; str[i] != 0; i++ {
-		n1 += runetochar(buf[:], rune(str[i]))
+		n1 += encoderune(buf[:], rune(str[i]))
 	}
 	s, b := rawstring(n1 + 4)
 	n2 := 0
@@ -387,8 +490,42 @@ func gostringw(strw *uint16) string {
 		if n2 >= n1 {
 			break
 		}
-		n2 += runetochar(b[n2:], rune(str[i]))
+		n2 += encoderune(b[n2:], rune(str[i]))
 	}
 	b[n2] = 0 // for luck
 	return s[:n2]
+}
+
+// parseRelease parses a dot-separated version number. It follows the
+// semver syntax, but allows the minor and patch versions to be
+// elided.
+func parseRelease(rel string) (major, minor, patch int, ok bool) {
+	// Strip anything after a dash or plus.
+	for i := 0; i < len(rel); i++ {
+		if rel[i] == '-' || rel[i] == '+' {
+			rel = rel[:i]
+			break
+		}
+	}
+
+	next := func() (int, bool) {
+		for i := 0; i < len(rel); i++ {
+			if rel[i] == '.' {
+				ver, ok := atoi(rel[:i])
+				rel = rel[i+1:]
+				return ver, ok
+			}
+		}
+		ver, ok := atoi(rel)
+		rel = ""
+		return ver, ok
+	}
+	if major, ok = next(); !ok || rel == "" {
+		return
+	}
+	if minor, ok = next(); !ok || rel == "" {
+		return
+	}
+	patch, ok = next()
+	return
 }

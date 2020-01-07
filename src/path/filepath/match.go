@@ -13,7 +13,7 @@ import (
 	"unicode/utf8"
 )
 
-// ErrBadPattern indicates a globbing pattern was malformed.
+// ErrBadPattern indicates a pattern was malformed.
 var ErrBadPattern = errors.New("syntax error in pattern")
 
 // Match reports whether name matches the shell file name pattern.
@@ -240,13 +240,14 @@ func Glob(pattern string) (matches []string, err error) {
 	}
 
 	dir, file := Split(pattern)
+	volumeLen := 0
 	if runtime.GOOS == "windows" {
-		dir = cleanGlobPathWindows(dir)
+		volumeLen, dir = cleanGlobPathWindows(dir)
 	} else {
 		dir = cleanGlobPath(dir)
 	}
 
-	if !hasMeta(dir) {
+	if !hasMeta(dir[volumeLen:]) {
 		return glob(dir, file, nil)
 	}
 
@@ -283,18 +284,21 @@ func cleanGlobPath(path string) string {
 }
 
 // cleanGlobPathWindows is windows version of cleanGlobPath.
-func cleanGlobPathWindows(path string) string {
+func cleanGlobPathWindows(path string) (prefixLen int, cleaned string) {
 	vollen := volumeNameLen(path)
 	switch {
 	case path == "":
-		return "."
+		return 0, "."
 	case vollen+1 == len(path) && os.IsPathSeparator(path[len(path)-1]): // /, \, C:\ and C:/
 		// do nothing to the path
-		return path
+		return vollen + 1, path
 	case vollen == len(path) && len(path) == 2: // C:
-		return path + "." // convert C: into C:.
+		return vollen, path + "." // convert C: into C:.
 	default:
-		return path[0 : len(path)-1] // chop off trailing separator
+		if vollen >= len(path) {
+			vollen = len(path) - 1
+		}
+		return vollen, path[0 : len(path)-1] // chop off trailing separator
 	}
 }
 
@@ -335,6 +339,9 @@ func glob(dir, pattern string, matches []string) (m []string, e error) {
 // hasMeta reports whether path contains any of the magic characters
 // recognized by Match.
 func hasMeta(path string) bool {
-	// TODO(niemeyer): Should other magic characters be added here?
-	return strings.ContainsAny(path, "*?[")
+	magicChars := `*?[`
+	if runtime.GOOS != "windows" {
+		magicChars = `*?[\`
+	}
+	return strings.ContainsAny(path, magicChars)
 }

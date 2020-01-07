@@ -47,7 +47,7 @@ func IsPPC64ISEL(op obj.As) bool {
 // one of the CMP instructions that require special handling.
 func IsPPC64CMP(op obj.As) bool {
 	switch op {
-	case ppc64.ACMP, ppc64.ACMPU, ppc64.ACMPW, ppc64.ACMPWU:
+	case ppc64.ACMP, ppc64.ACMPU, ppc64.ACMPW, ppc64.ACMPWU, ppc64.AFCMPU:
 		return true
 	}
 	return false
@@ -76,6 +76,10 @@ func ppc64RegisterNumber(name string, n int16) (int16, bool) {
 	case "CR":
 		if 0 <= n && n <= 7 {
 			return ppc64.REG_CR0 + n, true
+		}
+	case "VS":
+		if 0 <= n && n <= 63 {
+			return ppc64.REG_VS0 + n, true
 		}
 	case "V":
 		if 0 <= n && n <= 31 {

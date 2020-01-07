@@ -12,14 +12,18 @@ import (
 	"unsafe"
 )
 
+// finblock is an array of finalizers to be executed. finblocks are
+// arranged in a linked list for the finalizer queue.
+//
 // finblock is allocated from non-GC'd memory, so any heap pointers
-// must be specially handled.
+// must be specially handled. GC currently assumes that the finalizer
+// queue does not grow during marking (but it can shrink).
 //
 //go:notinheap
 type finblock struct {
 	alllink *finblock
 	next    *finblock
-	cnt     int32
+	cnt     uint32
 	_       int32
 	fin     [(_FinBlockSize - 2*sys.PtrSize - 2*4) / unsafe.Sizeof(finalizer{})]finalizer
 }
@@ -71,8 +75,18 @@ var finalizer1 = [...]byte{
 }
 
 func queuefinalizer(p unsafe.Pointer, fn *funcval, nret uintptr, fint *_type, ot *ptrtype) {
+	if gcphase != _GCoff {
+		// Currently we assume that the finalizer queue won't
+		// grow during marking so we don't have to rescan it
+		// during mark termination. If we ever need to lift
+		// this assumption, we can do it by adding the
+		// necessary barriers to queuefinalizer (which it may
+		// have automatically).
+		throw("queuefinalizer during GC")
+	}
+
 	lock(&finlock)
-	if finq == nil || finq.cnt == int32(len(finq.fin)) {
+	if finq == nil || finq.cnt == uint32(len(finq.fin)) {
 		if finc == nil {
 			finc = (*finblock)(persistentalloc(_FinBlockSize, 0, &memstats.gc_sys))
 			finc.alllink = allfin
@@ -99,7 +113,7 @@ func queuefinalizer(p unsafe.Pointer, fn *funcval, nret uintptr, fint *_type, ot
 		finq = block
 	}
 	f := &finq.fin[finq.cnt]
-	finq.cnt++
+	atomic.Xadd(&finq.cnt, +1) // Sync with markroots
 	f.fn = fn
 	f.nret = nret
 	f.fint = fint
@@ -112,7 +126,7 @@ func queuefinalizer(p unsafe.Pointer, fn *funcval, nret uintptr, fint *_type, ot
 //go:nowritebarrier
 func iterate_finq(callback func(*funcval, unsafe.Pointer, uintptr, *_type, *ptrtype)) {
 	for fb := allfin; fb != nil; fb = fb.alllink {
-		for i := int32(0); i < fb.cnt; i++ {
+		for i := uint32(0); i < fb.cnt; i++ {
 			f := &fb.fin[i]
 			callback(f.fn, f.arg, f.nret, f.fint, f.ot)
 		}
@@ -158,7 +172,7 @@ func runfinq() {
 			gp := getg()
 			fing = gp
 			fingwait = true
-			goparkunlock(&finlock, "finalizer wait", traceEvGoBlock, 1)
+			goparkunlock(&finlock, waitReasonFinalizerWait, traceEvGoBlock, 1)
 			continue
 		}
 		unlock(&finlock)
@@ -182,6 +196,11 @@ func runfinq() {
 				if f.fint == nil {
 					throw("missing type in runfinq")
 				}
+				// frame is effectively uninitialized
+				// memory. That means we have to clear
+				// it before writing to it to avoid
+				// confusing the write barrier.
+				*(*[2]uintptr)(frame) = [2]uintptr{}
 				switch f.fint.kind & kindMask {
 				case kindPtr:
 					// direct use of pointer
@@ -194,7 +213,7 @@ func runfinq() {
 					if len(ityp.mhdr) != 0 {
 						// convert to interface with methods
 						// this conversion is guaranteed to succeed - we checked in SetFinalizer
-						assertE2I(ityp, *(*eface)(frame), (*iface)(frame))
+						*(*iface)(frame) = assertE2I(ityp, *(*eface)(frame))
 					}
 				default:
 					throw("bad kind in runfinq")
@@ -203,11 +222,14 @@ func runfinq() {
 				reflectcall(nil, unsafe.Pointer(f.fn), frame, uint32(framesz), uint32(framesz))
 				fingRunning = false
 
-				// drop finalizer queue references to finalized object
+				// Drop finalizer queue heap references
+				// before hiding them from markroot.
+				// This also ensures these will be
+				// clear if we reuse the finalizer.
 				f.fn = nil
 				f.arg = nil
 				f.ot = nil
-				fb.cnt = i - 1
+				atomic.Store(&fb.cnt, i-1)
 			}
 			next := fb.next
 			lock(&finlock)
@@ -245,8 +267,8 @@ func runfinq() {
 // is not guaranteed to run, because there is no ordering that
 // respects the dependencies.
 //
-// The finalizer for obj is scheduled to run at some arbitrary time after
-// obj becomes unreachable.
+// The finalizer is scheduled to run at some arbitrary time after the
+// program can no longer reach the object to which obj points.
 // There is no guarantee that finalizers will run before a program exits,
 // so typically they are useful only for releasing non-memory resources
 // associated with an object during a long-running program.
@@ -304,9 +326,9 @@ func SetFinalizer(obj interface{}, finalizer interface{}) {
 	}
 
 	// find the containing object
-	_, base, _ := findObject(e.data)
+	base, _, _ := findObject(uintptr(e.data), 0, 0)
 
-	if base == nil {
+	if base == 0 {
 		// 0-length objects are okay.
 		if e.data == unsafe.Pointer(&zerobase) {
 			return
@@ -331,10 +353,10 @@ func SetFinalizer(obj interface{}, finalizer interface{}) {
 		throw("runtime.SetFinalizer: pointer not in allocated block")
 	}
 
-	if e.data != base {
+	if uintptr(e.data) != base {
 		// As an implementation detail we allow to set finalizers for an inner byte
 		// of an object if it could come from tiny alloc (see mallocgc for details).
-		if ot.elem == nil || ot.elem.kind&kindNoPointers == 0 || ot.elem.size >= maxTinySize {
+		if ot.elem == nil || ot.elem.ptrdata != 0 || ot.elem.size >= maxTinySize {
 			throw("runtime.SetFinalizer: pointer not at beginning of allocated block")
 		}
 	}
@@ -376,7 +398,7 @@ func SetFinalizer(obj interface{}, finalizer interface{}) {
 			// ok - satisfies empty interface
 			goto okarg
 		}
-		if assertE2I2(ityp, *efaceOf(&obj), nil) {
+		if _, ok := assertE2I2(ityp, *efaceOf(&obj)); ok {
 			goto okarg
 		}
 	}
@@ -385,9 +407,9 @@ okarg:
 	// compute size needed for return parameters
 	nret := uintptr(0)
 	for _, t := range ft.out() {
-		nret = round(nret, uintptr(t.align)) + uintptr(t.size)
+		nret = alignUp(nret, uintptr(t.align)) + uintptr(t.size)
 	}
-	nret = round(nret, sys.PtrSize)
+	nret = alignUp(nret, sys.PtrSize)
 
 	// make sure we have a finalizer goroutine
 	createfing()
@@ -399,51 +421,7 @@ okarg:
 	})
 }
 
-// Look up pointer v in heap. Return the span containing the object,
-// the start of the object, and the size of the object. If the object
-// does not exist, return nil, nil, 0.
-func findObject(v unsafe.Pointer) (s *mspan, x unsafe.Pointer, n uintptr) {
-	c := gomcache()
-	c.local_nlookup++
-	if sys.PtrSize == 4 && c.local_nlookup >= 1<<30 {
-		// purge cache stats to prevent overflow
-		lock(&mheap_.lock)
-		purgecachedstats(c)
-		unlock(&mheap_.lock)
-	}
-
-	// find span
-	arena_start := mheap_.arena_start
-	arena_used := mheap_.arena_used
-	if uintptr(v) < arena_start || uintptr(v) >= arena_used {
-		return
-	}
-	p := uintptr(v) >> pageShift
-	q := p - arena_start>>pageShift
-	s = *(**mspan)(add(unsafe.Pointer(mheap_.spans), q*sys.PtrSize))
-	if s == nil {
-		return
-	}
-	x = unsafe.Pointer(s.base())
-
-	if uintptr(v) < uintptr(x) || uintptr(v) >= uintptr(unsafe.Pointer(s.limit)) || s.state != mSpanInUse {
-		s = nil
-		x = nil
-		return
-	}
-
-	n = s.elemsize
-	if s.sizeclass != 0 {
-		x = add(x, (uintptr(v)-uintptr(x))/n*n)
-	}
-	return
-}
-
-// Mark KeepAlive as noinline so that the current compiler will ensure
-// that the argument is alive at the point of the function call.
-// If it were inlined, it would disappear, and there would be nothing
-// keeping the argument alive. Perhaps a future compiler will recognize
-// runtime.KeepAlive specially and do something more efficient.
+// Mark KeepAlive as noinline so that it is easily detectable as an intrinsic.
 //go:noinline
 
 // KeepAlive marks its argument as currently reachable.
@@ -465,4 +443,11 @@ func findObject(v unsafe.Pointer) (s *mspan, x unsafe.Pointer, n uintptr) {
 // Without the KeepAlive call, the finalizer could run at the start of
 // syscall.Read, closing the file descriptor before syscall.Read makes
 // the actual system call.
-func KeepAlive(interface{}) {}
+func KeepAlive(x interface{}) {
+	// Introduce a use of x that the compiler can't eliminate.
+	// This makes sure x is alive on entry. We need x to be alive
+	// on entry for "defer runtime.KeepAlive(x)"; see issue 21402.
+	if cgoAlwaysFalse {
+		println(x)
+	}
+}

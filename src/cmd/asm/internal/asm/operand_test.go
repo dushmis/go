@@ -5,18 +5,20 @@
 package asm
 
 import (
+	"strings"
 	"testing"
 
 	"cmd/asm/internal/arch"
 	"cmd/asm/internal/lex"
 	"cmd/internal/obj"
+	"cmd/internal/objabi"
 )
 
 // A simple in-out test: Do we print what we parse?
 
 func setArch(goarch string) (*arch.Arch, *obj.Link) {
-	obj.GOOS = "linux" // obj can handle this OS for all architectures.
-	obj.GOARCH = goarch
+	objabi.GOOS = "linux" // obj can handle this OS for all architectures.
+	objabi.GOARCH = goarch
 	architecture := arch.Set(goarch)
 	if architecture == nil {
 		panic("asm: unrecognized architecture " + goarch)
@@ -27,6 +29,45 @@ func setArch(goarch string) (*arch.Arch, *obj.Link) {
 func newParser(goarch string) *Parser {
 	architecture, ctxt := setArch(goarch)
 	return NewParser(ctxt, architecture, nil)
+}
+
+// tryParse executes parse func in panicOnError=true context.
+// parse is expected to call any parsing methods that may panic.
+// Returns error gathered from recover; nil if no parse errors occurred.
+//
+// For unexpected panics, calls t.Fatal.
+func tryParse(t *testing.T, parse func()) (err error) {
+	panicOnError = true
+	defer func() {
+		panicOnError = false
+
+		e := recover()
+		var ok bool
+		if err, ok = e.(error); e != nil && !ok {
+			t.Fatal(e)
+		}
+	}()
+
+	parse()
+
+	return nil
+}
+
+func testBadOperandParser(t *testing.T, parser *Parser, tests []badOperandTest) {
+	for _, test := range tests {
+		err := tryParse(t, func() {
+			parser.start(lex.Tokenize(test.input))
+			addr := obj.Addr{}
+			parser.operand(&addr)
+		})
+
+		switch {
+		case err == nil:
+			t.Errorf("fail at %s: got no errors; expected %s\n", test.input, test.error)
+		case !strings.Contains(err.Error(), test.error):
+			t.Errorf("fail at %s: got %s; expected %s", test.input, err, test.error)
+		}
+	}
 }
 
 func testOperandParser(t *testing.T, parser *Parser, tests []operandTest) {
@@ -44,6 +85,7 @@ func testOperandParser(t *testing.T, parser *Parser, tests []operandTest) {
 func TestAMD64OperandParser(t *testing.T) {
 	parser := newParser("amd64")
 	testOperandParser(t, parser, amd64OperandTests)
+	testBadOperandParser(t, parser, amd64BadOperandTests)
 }
 
 func Test386OperandParser(t *testing.T) {
@@ -65,6 +107,11 @@ func TestPPC64OperandParser(t *testing.T) {
 	testOperandParser(t, parser, ppc64OperandTests)
 }
 
+func TestMIPSOperandParser(t *testing.T) {
+	parser := newParser("mips")
+	testOperandParser(t, parser, mipsOperandTests)
+}
+
 func TestMIPS64OperandParser(t *testing.T) {
 	parser := newParser("mips64")
 	testOperandParser(t, parser, mips64OperandTests)
@@ -75,8 +122,56 @@ func TestS390XOperandParser(t *testing.T) {
 	testOperandParser(t, parser, s390xOperandTests)
 }
 
+func TestFuncAddress(t *testing.T) {
+	type subtest struct {
+		arch  string
+		tests []operandTest
+	}
+	for _, sub := range []subtest{
+		{"amd64", amd64OperandTests},
+		{"386", x86OperandTests},
+		{"arm", armOperandTests},
+		{"arm64", arm64OperandTests},
+		{"ppc64", ppc64OperandTests},
+		{"mips", mipsOperandTests},
+		{"mips64", mips64OperandTests},
+		{"s390x", s390xOperandTests},
+	} {
+		t.Run(sub.arch, func(t *testing.T) {
+			parser := newParser(sub.arch)
+			for _, test := range sub.tests {
+				parser.start(lex.Tokenize(test.input))
+				name, ok := parser.funcAddress()
+
+				isFuncSym := strings.HasSuffix(test.input, "(SB)") &&
+					// Ignore static symbols.
+					!strings.Contains(test.input, "<>")
+
+				wantName := ""
+				if isFuncSym {
+					// Strip $|* and (SB) and +Int.
+					wantName = test.output[:len(test.output)-4]
+					if strings.HasPrefix(wantName, "$") || strings.HasPrefix(wantName, "*") {
+						wantName = wantName[1:]
+					}
+					if i := strings.Index(wantName, "+"); i >= 0 {
+						wantName = wantName[:i]
+					}
+				}
+				if ok != isFuncSym || name != wantName {
+					t.Errorf("fail at %s as function address: got %s, %v; expected %s, %v", test.input, name, ok, wantName, isFuncSym)
+				}
+			}
+		})
+	}
+}
+
 type operandTest struct {
 	input, output string
+}
+
+type badOperandTest struct {
+	input, error string
 }
 
 // Examples collected by scanning all the assembly in the standard repo.
@@ -196,7 +291,26 @@ var amd64OperandTests = []operandTest{
 	{"y+56(FP)", "y+56(FP)"},
 	{"·AddUint32(SB)", "\"\".AddUint32(SB)"},
 	{"·callReflect(SB)", "\"\".callReflect(SB)"},
+	{"[X0-X0]", "[X0-X0]"},
+	{"[ Z9 - Z12 ]", "[Z9-Z12]"},
+	{"[X0-AX]", "[X0-AX]"},
+	{"[AX-X0]", "[AX-X0]"},
 	{"[):[o-FP", ""}, // Issue 12469 - asm hung parsing the o-FP range on non ARM platforms.
+}
+
+var amd64BadOperandTests = []badOperandTest{
+	{"[", "register list: expected ']', found EOF"},
+	{"[4", "register list: bad low register in `[4`"},
+	{"[]", "register list: bad low register in `[]`"},
+	{"[f-x]", "register list: bad low register in `[f`"},
+	{"[r10-r13]", "register list: bad low register in `[r10`"},
+	{"[k3-k6]", "register list: bad low register in `[k3`"},
+	{"[X0]", "register list: expected '-' after `[X0`, found ']'"},
+	{"[X0-]", "register list: bad high register in `[X0-]`"},
+	{"[X0-x]", "register list: bad high register in `[X0-x`"},
+	{"[X0-X1-X2]", "register list: expected ']' after `[X0-X1`, found '-'"},
+	{"[X0,X3]", "register list: expected '-' after `[X0`, found ','"},
+	{"[X0,X1,X2,X3]", "register list: expected '-' after `[X0`, found ','"},
 }
 
 var x86OperandTests = []operandTest{
@@ -300,7 +414,7 @@ var armOperandTests = []operandTest{
 	{"g", "g"},
 	{"gosave<>(SB)", "gosave<>(SB)"},
 	{"retlo+12(FP)", "retlo+12(FP)"},
-	{"runtime·_sfloat2(SB)", "runtime._sfloat2(SB)"},
+	{"runtime·gogo(SB)", "runtime.gogo(SB)"},
 	{"·AddUint32(SB)", "\"\".AddUint32(SB)"},
 	{"(R1, R3)", "(R1, R3)"},
 	{"[R0,R1,g,R15", ""}, // Issue 11764 - asm hung parsing ']' missing register lists.
@@ -340,6 +454,70 @@ var ppc64OperandTests = []operandTest{
 	{"6(PC)", "6(PC)"},
 	{"CR7", "CR7"},
 	{"CTR", "CTR"},
+	{"VS0", "VS0"},
+	{"VS1", "VS1"},
+	{"VS2", "VS2"},
+	{"VS3", "VS3"},
+	{"VS4", "VS4"},
+	{"VS5", "VS5"},
+	{"VS6", "VS6"},
+	{"VS7", "VS7"},
+	{"VS8", "VS8"},
+	{"VS9", "VS9"},
+	{"VS10", "VS10"},
+	{"VS11", "VS11"},
+	{"VS12", "VS12"},
+	{"VS13", "VS13"},
+	{"VS14", "VS14"},
+	{"VS15", "VS15"},
+	{"VS16", "VS16"},
+	{"VS17", "VS17"},
+	{"VS18", "VS18"},
+	{"VS19", "VS19"},
+	{"VS20", "VS20"},
+	{"VS21", "VS21"},
+	{"VS22", "VS22"},
+	{"VS23", "VS23"},
+	{"VS24", "VS24"},
+	{"VS25", "VS25"},
+	{"VS26", "VS26"},
+	{"VS27", "VS27"},
+	{"VS28", "VS28"},
+	{"VS29", "VS29"},
+	{"VS30", "VS30"},
+	{"VS31", "VS31"},
+	{"VS32", "VS32"},
+	{"VS33", "VS33"},
+	{"VS34", "VS34"},
+	{"VS35", "VS35"},
+	{"VS36", "VS36"},
+	{"VS37", "VS37"},
+	{"VS38", "VS38"},
+	{"VS39", "VS39"},
+	{"VS40", "VS40"},
+	{"VS41", "VS41"},
+	{"VS42", "VS42"},
+	{"VS43", "VS43"},
+	{"VS44", "VS44"},
+	{"VS45", "VS45"},
+	{"VS46", "VS46"},
+	{"VS47", "VS47"},
+	{"VS48", "VS48"},
+	{"VS49", "VS49"},
+	{"VS50", "VS50"},
+	{"VS51", "VS51"},
+	{"VS52", "VS52"},
+	{"VS53", "VS53"},
+	{"VS54", "VS54"},
+	{"VS55", "VS55"},
+	{"VS56", "VS56"},
+	{"VS57", "VS57"},
+	{"VS58", "VS58"},
+	{"VS59", "VS59"},
+	{"VS60", "VS60"},
+	{"VS61", "VS61"},
+	{"VS62", "VS62"},
+	{"VS63", "VS63"},
 	{"V0", "V0"},
 	{"V1", "V1"},
 	{"V2", "V2"},
@@ -473,6 +651,7 @@ var arm64OperandTests = []operandTest{
 	{"R0", "R0"},
 	{"R10", "R10"},
 	{"R11", "R11"},
+	{"R18_PLATFORM", "R18"},
 	{"$4503601774854144.0", "$(4503601774854144.0)"},
 	{"$runtime·badsystemstack(SB)", "$runtime.badsystemstack(SB)"},
 	{"ZR", "ZR"},
@@ -556,7 +735,90 @@ var mips64OperandTests = []operandTest{
 	{"LO", "LO"},
 	{"a(FP)", "a(FP)"},
 	{"g", "g"},
-	{"RSB", "RSB"},
+	{"RSB", "R28"},
+	{"ret+8(FP)", "ret+8(FP)"},
+	{"runtime·abort(SB)", "runtime.abort(SB)"},
+	{"·AddUint32(SB)", "\"\".AddUint32(SB)"},
+	{"·trunc(SB)", "\"\".trunc(SB)"},
+	{"[):[o-FP", ""}, // Issue 12469 - asm hung parsing the o-FP range on non ARM platforms.
+}
+
+var mipsOperandTests = []operandTest{
+	{"$((1<<63)-1)", "$9223372036854775807"},
+	{"$(-64*1024)", "$-65536"},
+	{"$(1024 * 8)", "$8192"},
+	{"$-1", "$-1"},
+	{"$-24(R4)", "$-24(R4)"},
+	{"$0", "$0"},
+	{"$0(R1)", "$(R1)"},
+	{"$0.5", "$(0.5)"},
+	{"$0x7000", "$28672"},
+	{"$0x88888eef", "$2290650863"},
+	{"$1", "$1"},
+	{"$_main<>(SB)", "$_main<>(SB)"},
+	{"$argframe(FP)", "$argframe(FP)"},
+	{"$~3", "$-4"},
+	{"(-288-3*8)(R1)", "-312(R1)"},
+	{"(16)(R7)", "16(R7)"},
+	{"(8)(g)", "8(g)"},
+	{"(R0)", "(R0)"},
+	{"(R3)", "(R3)"},
+	{"(R4)", "(R4)"},
+	{"(R5)", "(R5)"},
+	{"-1(R4)", "-1(R4)"},
+	{"-1(R5)", "-1(R5)"},
+	{"6(PC)", "6(PC)"},
+	{"F14", "F14"},
+	{"F15", "F15"},
+	{"F16", "F16"},
+	{"F17", "F17"},
+	{"F18", "F18"},
+	{"F19", "F19"},
+	{"F20", "F20"},
+	{"F21", "F21"},
+	{"F22", "F22"},
+	{"F23", "F23"},
+	{"F24", "F24"},
+	{"F25", "F25"},
+	{"F26", "F26"},
+	{"F27", "F27"},
+	{"F28", "F28"},
+	{"F29", "F29"},
+	{"F30", "F30"},
+	{"F31", "F31"},
+	{"R0", "R0"},
+	{"R1", "R1"},
+	{"R11", "R11"},
+	{"R12", "R12"},
+	{"R13", "R13"},
+	{"R14", "R14"},
+	{"R15", "R15"},
+	{"R16", "R16"},
+	{"R17", "R17"},
+	{"R18", "R18"},
+	{"R19", "R19"},
+	{"R2", "R2"},
+	{"R20", "R20"},
+	{"R21", "R21"},
+	{"R22", "R22"},
+	{"R23", "R23"},
+	{"R24", "R24"},
+	{"R25", "R25"},
+	{"R26", "R26"},
+	{"R27", "R27"},
+	{"R28", "R28"},
+	{"R29", "R29"},
+	{"R3", "R3"},
+	{"R31", "R31"},
+	{"R4", "R4"},
+	{"R5", "R5"},
+	{"R6", "R6"},
+	{"R7", "R7"},
+	{"R8", "R8"},
+	{"R9", "R9"},
+	{"LO", "LO"},
+	{"a(FP)", "a(FP)"},
+	{"g", "g"},
 	{"ret+8(FP)", "ret+8(FP)"},
 	{"runtime·abort(SB)", "runtime.abort(SB)"},
 	{"·AddUint32(SB)", "\"\".AddUint32(SB)"},

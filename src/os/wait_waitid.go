@@ -2,7 +2,10 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build darwin linux
+// We used to used this code for Darwin, but according to issue #19314
+// waitid returns if the process is stopped, even when using WEXITED.
+
+// +build linux
 
 package os
 
@@ -15,7 +18,7 @@ import (
 const _P_PID = 1
 
 // blockUntilWaitable attempts to block until a call to p.Wait will
-// succeed immediately, and returns whether it has done so.
+// succeed immediately, and reports whether it has done so.
 // It does not actually call p.Wait.
 func (p *Process) blockUntilWaitable() (bool, error) {
 	// The waitid system call expects a pointer to a siginfo_t,
@@ -23,7 +26,7 @@ func (p *Process) blockUntilWaitable() (bool, error) {
 	// On Darwin, it requires greater than or equal to 64 bytes
 	// for darwin/{386,arm} and 104 bytes for darwin/amd64.
 	// We don't care about the values it returns.
-	var siginfo [128]byte
+	var siginfo [16]uint64
 	psig := &siginfo[0]
 	_, _, e := syscall.Syscall6(syscall.SYS_WAITID, _P_PID, uintptr(p.Pid), uintptr(unsafe.Pointer(psig)), syscall.WEXITED|syscall.WNOWAIT, 0, 0)
 	runtime.KeepAlive(p)

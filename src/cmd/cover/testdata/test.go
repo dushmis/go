@@ -10,6 +10,10 @@
 
 package main
 
+import _ "unsafe" // for go:linkname
+
+//go:linkname some_name some_name
+
 const anything = 1e9 // Just some unlikely value that means "we got here, don't care how often"
 
 func testAll() {
@@ -128,6 +132,10 @@ func testBlockRun() {
 
 func testSwitch() {
 	for i := 0; i < 5; func() { i++; check(LINE, 5) }() {
+		goto label2
+	label1:
+		goto label1
+	label2:
 		switch i {
 		case 0:
 			check(LINE, 1)
@@ -246,6 +254,18 @@ func testFunctionLiteral() {
 		check(LINE, 2)
 	}) {
 	}
+
+	x := 2
+	switch x {
+	case func() int { check(LINE, 1); return 1 }():
+		check(LINE, 0)
+		panic("2=1")
+	case func() int { check(LINE, 1); return 2 }():
+		check(LINE, 1)
+	case func() int { check(LINE, 0); return 3 }():
+		check(LINE, 0)
+		panic("2=3")
+	}
 }
 
 func testGoto() {
@@ -266,7 +286,7 @@ loop:
 	}
 }
 
-// This comment shouldn't appear in generated go code.
+// This comment didn't appear in generated go code.
 func haha() {
 	// Needed for cover to add counter increment here.
 	_ = 42

@@ -50,6 +50,10 @@ func (t *Template) Name() string {
 // New allocates a new, undefined template associated with the given one and with the same
 // delimiters. The association, which is transitive, allows one template to
 // invoke another with a {{template}} action.
+//
+// Because associated templates share underlying data, template construction
+// cannot be done safely in parallel. Once the templates are constructed, they
+// can be executed in parallel.
 func (t *Template) New(name string) *Template {
 	t.init()
 	nt := &Template{
@@ -106,28 +110,27 @@ func (t *Template) Clone() (*Template, error) {
 
 // copy returns a shallow copy of t, with common set to the argument.
 func (t *Template) copy(c *common) *Template {
-	nt := New(t.name)
-	nt.Tree = t.Tree
-	nt.common = c
-	nt.leftDelim = t.leftDelim
-	nt.rightDelim = t.rightDelim
-	return nt
+	return &Template{
+		name:       t.name,
+		Tree:       t.Tree,
+		common:     c,
+		leftDelim:  t.leftDelim,
+		rightDelim: t.rightDelim,
+	}
 }
 
-// AddParseTree adds parse tree for template with given name and associates it with t.
-// If the template does not already exist, it will create a new one.
-// If the template does exist, it will be replaced.
+// AddParseTree associates the argument parse tree with the template t, giving
+// it the specified name. If the template has not been defined, this tree becomes
+// its definition. If it has been defined and already has that name, the existing
+// definition is replaced; otherwise a new template is created, defined, and returned.
 func (t *Template) AddParseTree(name string, tree *parse.Tree) (*Template, error) {
 	t.init()
-	// If the name is the name of this template, overwrite this template.
 	nt := t
 	if name != t.name {
 		nt = t.New(name)
 	}
 	// Even if nt == t, we need to install it in the common.tmpl map.
-	if replace, err := t.associate(nt, tree); err != nil {
-		return nil, err
-	} else if replace {
+	if t.associate(nt, tree) || nt.Tree == nil {
 		nt.Tree = tree
 	}
 	return nt, nil
@@ -159,6 +162,7 @@ func (t *Template) Delims(left, right string) *Template {
 }
 
 // Funcs adds the elements of the argument map to the template's function map.
+// It must be called before the template is parsed.
 // It panics if a value in the map is not a function with appropriate return
 // type or if the name cannot be used syntactically as a function in a template.
 // It is legal to overwrite elements of the map. The return value is the template,
@@ -181,9 +185,16 @@ func (t *Template) Lookup(name string) *Template {
 	return t.tmpl[name]
 }
 
-// Parse defines the template by parsing the text. Nested template definitions will be
-// associated with the top-level template t. Parse may be called multiple times
-// to parse definitions of templates to associate with t.
+// Parse parses text as a template body for t.
+// Named template definitions ({{define ...}} or {{block ...}} statements) in text
+// define additional templates associated with t and are removed from the
+// definition of t itself.
+//
+// Templates can be redefined in successive calls to Parse.
+// A template definition with a body containing only white space and comments
+// is considered empty and will not replace an existing template's body.
+// This allows using Parse to add new named template definitions without
+// overwriting the main template body.
 func (t *Template) Parse(text string) (*Template, error) {
 	t.init()
 	t.muFuncs.RLock()
@@ -204,15 +215,15 @@ func (t *Template) Parse(text string) (*Template, error) {
 // associate installs the new template into the group of templates associated
 // with t. The two are already known to share the common structure.
 // The boolean return value reports whether to store this tree as t.Tree.
-func (t *Template) associate(new *Template, tree *parse.Tree) (bool, error) {
+func (t *Template) associate(new *Template, tree *parse.Tree) bool {
 	if new.common != t.common {
 		panic("internal error: associate not common")
 	}
-	if t.tmpl[new.name] != nil && parse.IsEmptyTree(tree.Root) && t.Tree != nil {
+	if old := t.tmpl[new.name]; old != nil && parse.IsEmptyTree(tree.Root) && old.Tree != nil {
 		// If a template by that name exists,
 		// don't replace it with an empty template.
-		return false, nil
+		return false
 	}
 	t.tmpl[new.name] = new
-	return true, nil
+	return true
 }

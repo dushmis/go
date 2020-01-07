@@ -25,7 +25,7 @@ type reqTest struct {
 }
 
 var noError = ""
-var noBody = ""
+var noBodyStr = ""
 var noTrailer Header = nil
 
 var reqTests = []reqTest{
@@ -95,7 +95,7 @@ var reqTests = []reqTest{
 			RequestURI:    "/",
 		},
 
-		noBody,
+		noBodyStr,
 		noTrailer,
 		noError,
 	},
@@ -121,19 +121,19 @@ var reqTests = []reqTest{
 			RequestURI:    "//user@host/is/actually/a/path/",
 		},
 
-		noBody,
+		noBodyStr,
 		noTrailer,
 		noError,
 	},
 
-	// Tests a bogus abs_path on the Request-Line (RFC 2616 section 5.1.2)
+	// Tests a bogus absolute-path on the Request-Line (RFC 7230 section 5.3.1)
 	{
 		"GET ../../../../etc/passwd HTTP/1.1\r\n" +
 			"Host: test\r\n\r\n",
 		nil,
-		noBody,
+		noBodyStr,
 		noTrailer,
-		"parse ../../../../etc/passwd: invalid URI for request",
+		`parse "../../../../etc/passwd": invalid URI for request`,
 	},
 
 	// Tests missing URL:
@@ -141,9 +141,9 @@ var reqTests = []reqTest{
 		"GET  HTTP/1.1\r\n" +
 			"Host: test\r\n\r\n",
 		nil,
-		noBody,
+		noBodyStr,
 		noTrailer,
-		"parse : empty url",
+		`parse "": empty url`,
 	},
 
 	// Tests chunked body with trailer:
@@ -227,7 +227,7 @@ var reqTests = []reqTest{
 			RequestURI:    "www.google.com:443",
 		},
 
-		noBody,
+		noBodyStr,
 		noTrailer,
 		noError,
 	},
@@ -251,7 +251,7 @@ var reqTests = []reqTest{
 			RequestURI:    "127.0.0.1:6060",
 		},
 
-		noBody,
+		noBodyStr,
 		noTrailer,
 		noError,
 	},
@@ -275,7 +275,7 @@ var reqTests = []reqTest{
 			RequestURI:    "/_goRPC_",
 		},
 
-		noBody,
+		noBodyStr,
 		noTrailer,
 		noError,
 	},
@@ -299,7 +299,7 @@ var reqTests = []reqTest{
 			RequestURI:    "*",
 		},
 
-		noBody,
+		noBodyStr,
 		noTrailer,
 		noError,
 	},
@@ -323,7 +323,7 @@ var reqTests = []reqTest{
 			RequestURI:    "*",
 		},
 
-		noBody,
+		noBodyStr,
 		noTrailer,
 		noError,
 	},
@@ -350,7 +350,7 @@ var reqTests = []reqTest{
 			RequestURI: "/",
 		},
 
-		noBody,
+		noBodyStr,
 		noTrailer,
 		noError,
 	},
@@ -376,7 +376,7 @@ var reqTests = []reqTest{
 			RequestURI: "/",
 		},
 
-		noBody,
+		noBodyStr,
 		noTrailer,
 		noError,
 	},
@@ -397,7 +397,7 @@ var reqTests = []reqTest{
 			ContentLength: -1,
 			Close:         true,
 		},
-		noBody,
+		noBodyStr,
 		noTrailer,
 		noError,
 	},
@@ -438,7 +438,7 @@ func TestReadRequest(t *testing.T) {
 // reqBytes treats req as a request (with \n delimiters) and returns it with \r\n delimiters,
 // ending in \r\n\r\n
 func reqBytes(req string) []byte {
-	return []byte(strings.Replace(strings.TrimSpace(req), "\n", "\r\n", -1) + "\r\n\r\n")
+	return []byte(strings.ReplaceAll(strings.TrimSpace(req), "\n", "\r\n") + "\r\n\r\n")
 }
 
 var badRequestTests = []struct {
@@ -453,6 +453,14 @@ Content-Length: 4
 abc`)},
 	{"smuggle_content_len_head", reqBytes(`HEAD / HTTP/1.1
 Host: foo
+Content-Length: 5`)},
+
+	// golang.org/issue/22464
+	{"leading_space_in_header", reqBytes(`HEAD / HTTP/1.1
+ Host: foo
+Content-Length: 5`)},
+	{"leading_tab_in_header", reqBytes(`HEAD / HTTP/1.1
+\tHost: foo
 Content-Length: 5`)},
 }
 

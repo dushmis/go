@@ -1,10 +1,11 @@
-// Copyright 2016 The Go Authors.  All rights reserved.
+// Copyright 2016 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
 package pe
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -13,8 +14,9 @@ import (
 // cstring converts ASCII byte sequence b to string.
 // It stops once it finds 0 or reaches end of b.
 func cstring(b []byte) string {
-	var i int
-	for i = 0; i < len(b) && b[i] != 0; i++ {
+	i := bytes.IndexByte(b, 0)
+	if i == -1 {
+		i = len(b)
 	}
 	return string(b[:i])
 }
@@ -28,7 +30,7 @@ func readStringTable(fh *FileHeader, r io.ReadSeeker) (StringTable, error) {
 		return nil, nil
 	}
 	offset := fh.PointerToSymbolTable + COFFSymbolSize*fh.NumberOfSymbols
-	_, err := r.Seek(int64(offset), io.SeekStart)
+	_, err := r.Seek(int64(offset), seekStart)
 	if err != nil {
 		return nil, fmt.Errorf("fail to seek to string table: %v", err)
 	}

@@ -5,6 +5,7 @@
 package time
 
 import (
+	"errors"
 	"sync"
 	"syscall"
 )
@@ -13,7 +14,8 @@ import (
 
 // A Location maps time instants to the zone in use at that time.
 // Typically, the Location represents the collection of time offsets
-// in use in a geographical area, such as CEST and CET for central Europe.
+// in use in a geographical area. For many Locations the time offset varies
+// depending on whether daylight savings time is in use at the time instant.
 type Location struct {
 	name string
 	zone []zone
@@ -33,7 +35,7 @@ type Location struct {
 	cacheZone  *zone
 }
 
-// A zone represents a single time zone such as CEST or CET.
+// A zone represents a single time zone such as CET.
 type zone struct {
 	name   string // abbreviated name, "CET"
 	offset int    // seconds east of UTC
@@ -63,6 +65,11 @@ var UTC *Location = &utcLoc
 var utcLoc = Location{name: "UTC"}
 
 // Local represents the system's local time zone.
+// On Unix systems, Local consults the TZ environment
+// variable to find the time zone to use. No TZ means
+// use the system default /etc/localtime.
+// TZ="" means use UTC.
+// TZ="foo" means use file foo in the system timezone directory.
 var Local *Location = &localLoc
 
 // localLoc is separate so that initLocal can initialize
@@ -81,7 +88,7 @@ func (l *Location) get() *Location {
 }
 
 // String returns a descriptive name for the time zone information,
-// corresponding to the argument to LoadLocation.
+// corresponding to the name argument to LoadLocation or FixedZone.
 func (l *Location) String() string {
 	return l.get().name
 }
@@ -107,13 +114,12 @@ func FixedZone(name string, offset int) *Location {
 // the start and end times bracketing sec when that zone is in effect,
 // the offset in seconds east of UTC (such as -5*60*60), and whether
 // the daylight savings is being observed at that time.
-func (l *Location) lookup(sec int64) (name string, offset int, isDST bool, start, end int64) {
+func (l *Location) lookup(sec int64) (name string, offset int, start, end int64) {
 	l = l.get()
 
 	if len(l.zone) == 0 {
 		name = "UTC"
 		offset = 0
-		isDST = false
 		start = alpha
 		end = omega
 		return
@@ -122,7 +128,6 @@ func (l *Location) lookup(sec int64) (name string, offset int, isDST bool, start
 	if zone := l.cacheZone; zone != nil && l.cacheStart <= sec && sec < l.cacheEnd {
 		name = zone.name
 		offset = zone.offset
-		isDST = zone.isDST
 		start = l.cacheStart
 		end = l.cacheEnd
 		return
@@ -132,7 +137,6 @@ func (l *Location) lookup(sec int64) (name string, offset int, isDST bool, start
 		zone := &l.zone[l.lookupFirstZone()]
 		name = zone.name
 		offset = zone.offset
-		isDST = zone.isDST
 		start = alpha
 		if len(l.tx) > 0 {
 			end = l.tx[0].when
@@ -161,7 +165,6 @@ func (l *Location) lookup(sec int64) (name string, offset int, isDST bool, start
 	zone := &l.zone[tx[lo].index]
 	name = zone.name
 	offset = zone.offset
-	isDST = zone.isDST
 	start = tx[lo].when
 	// end = maintained during the search
 	return
@@ -172,7 +175,7 @@ func (l *Location) lookup(sec int64) (name string, offset int, isDST bool, start
 // times.
 //
 // The reference implementation in localtime.c from
-// http://www.iana.org/time-zones/repository/releases/tzcode2013g.tar.gz
+// https://www.iana.org/time-zones/repository/releases/tzcode2013g.tar.gz
 // implements the following algorithm for these cases:
 // 1) If the first zone is unused by the transitions, use it.
 // 2) Otherwise, if there are transition times, and the first
@@ -208,7 +211,7 @@ func (l *Location) lookupFirstZone() int {
 	return 0
 }
 
-// firstZoneUsed returns whether the first zone is used by some
+// firstZoneUsed reports whether the first zone is used by some
 // transition.
 func (l *Location) firstZoneUsed() bool {
 	for _, tx := range l.tx {
@@ -222,7 +225,7 @@ func (l *Location) firstZoneUsed() bool {
 // lookupName returns information about the time zone with
 // the given name (such as "EST") at the given pseudo-Unix time
 // (what the given time of day would be in UTC).
-func (l *Location) lookupName(name string, unix int64) (offset int, isDST bool, ok bool) {
+func (l *Location) lookupName(name string, unix int64) (offset int, ok bool) {
 	l = l.get()
 
 	// First try for a zone with the right name that was actually
@@ -234,9 +237,9 @@ func (l *Location) lookupName(name string, unix int64) (offset int, isDST bool, 
 	for i := range l.zone {
 		zone := &l.zone[i]
 		if zone.name == name {
-			nam, offset, isDST, _, _ := l.lookup(unix - int64(zone.offset))
+			nam, offset, _, _ := l.lookup(unix - int64(zone.offset))
 			if nam == zone.name {
-				return offset, isDST, true
+				return offset, true
 			}
 		}
 	}
@@ -245,7 +248,7 @@ func (l *Location) lookupName(name string, unix int64) (offset int, isDST bool, 
 	for i := range l.zone {
 		zone := &l.zone[i]
 		if zone.name == name {
-			return zone.offset, zone.isDST, true
+			return zone.offset, true
 		}
 	}
 
@@ -256,7 +259,10 @@ func (l *Location) lookupName(name string, unix int64) (offset int, isDST bool, 
 // NOTE(rsc): Eventually we will need to accept the POSIX TZ environment
 // syntax too, but I don't feel like implementing it today.
 
-var zoneinfo, _ = syscall.Getenv("ZONEINFO")
+var errLocation = errors.New("time: invalid location name")
+
+var zoneinfo *string
+var zoneinfoOnce sync.Once
 
 // LoadLocation returns the Location with the given name.
 //
@@ -279,11 +285,43 @@ func LoadLocation(name string) (*Location, error) {
 	if name == "Local" {
 		return Local, nil
 	}
-	if zoneinfo != "" {
-		if z, err := loadZoneFile(zoneinfo, name); err == nil {
-			z.name = name
-			return z, nil
+	if containsDotDot(name) || name[0] == '/' || name[0] == '\\' {
+		// No valid IANA Time Zone name contains a single dot,
+		// much less dot dot. Likewise, none begin with a slash.
+		return nil, errLocation
+	}
+	zoneinfoOnce.Do(func() {
+		env, _ := syscall.Getenv("ZONEINFO")
+		zoneinfo = &env
+	})
+	var firstErr error
+	if *zoneinfo != "" {
+		if zoneData, err := loadTzinfoFromDirOrZip(*zoneinfo, name); err == nil {
+			if z, err := LoadLocationFromTZData(name, zoneData); err == nil {
+				return z, nil
+			}
+			firstErr = err
+		} else if err != syscall.ENOENT {
+			firstErr = err
 		}
 	}
-	return loadLocation(name)
+	if z, err := loadLocation(name, zoneSources); err == nil {
+		return z, nil
+	} else if firstErr == nil {
+		firstErr = err
+	}
+	return nil, firstErr
+}
+
+// containsDotDot reports whether s contains "..".
+func containsDotDot(s string) bool {
+	if len(s) < 2 {
+		return false
+	}
+	for i := 0; i < len(s)-1; i++ {
+		if s[i] == '.' && s[i+1] == '.' {
+			return true
+		}
+	}
+	return false
 }

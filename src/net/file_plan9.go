@@ -81,7 +81,7 @@ func newFileFD(f *os.File) (net *netFD, err error) {
 	if err != nil {
 		return nil, err
 	}
-	return newFD(comp[1], name, ctl, nil, laddr, nil)
+	return newFD(comp[1], name, nil, ctl, nil, laddr, nil)
 }
 
 func fileConn(f *os.File) (Conn, error) {
@@ -127,7 +127,7 @@ func fileListener(f *os.File) (Listener, error) {
 		return nil, errors.New("file does not represent a listener")
 	}
 
-	return &TCPListener{fd}, nil
+	return &TCPListener{fd: fd}, nil
 }
 
 func filePacketConn(f *os.File) (PacketConn, error) {

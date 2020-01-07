@@ -6,19 +6,40 @@ package httptest
 
 import (
 	"bytes"
+	"fmt"
 	"io/ioutil"
 	"net/http"
 	"strconv"
 	"strings"
+
+	"golang.org/x/net/http/httpguts"
 )
 
 // ResponseRecorder is an implementation of http.ResponseWriter that
 // records its mutations for later inspection in tests.
 type ResponseRecorder struct {
-	Code      int           // the HTTP response code from WriteHeader
-	HeaderMap http.Header   // the HTTP response headers
-	Body      *bytes.Buffer // if non-nil, the bytes.Buffer to append written data to
-	Flushed   bool
+	// Code is the HTTP response code set by WriteHeader.
+	//
+	// Note that if a Handler never calls WriteHeader or Write,
+	// this might end up being 0, rather than the implicit
+	// http.StatusOK. To get the implicit value, use the Result
+	// method.
+	Code int
+
+	// HeaderMap contains the headers explicitly set by the Handler.
+	// It is an internal detail.
+	//
+	// Deprecated: HeaderMap exists for historical compatibility
+	// and should not be used. To access the headers returned by a handler,
+	// use the Response.Header map as returned by the Result method.
+	HeaderMap http.Header
+
+	// Body is the buffer to which the Handler's Write calls are sent.
+	// If nil, the Writes are silently discarded.
+	Body *bytes.Buffer
+
+	// Flushed is whether the Handler called Flush.
+	Flushed bool
 
 	result      *http.Response // cache of Result's return value
 	snapHeader  http.Header    // snapshot of HeaderMap at first Write
@@ -38,7 +59,10 @@ func NewRecorder() *ResponseRecorder {
 // an explicit DefaultRemoteAddr isn't set on ResponseRecorder.
 const DefaultRemoteAddr = "1.2.3.4"
 
-// Header returns the response headers.
+// Header implements http.ResponseWriter. It returns the response
+// headers to mutate within a handler. To test the headers that were
+// written after a handler completes, use the Result method and see
+// the returned Response value's Header.
 func (rw *ResponseRecorder) Header() http.Header {
 	m := rw.HeaderMap
 	if m == nil {
@@ -77,7 +101,8 @@ func (rw *ResponseRecorder) writeHeader(b []byte, str string) {
 	rw.WriteHeader(200)
 }
 
-// Write always succeeds and writes to rw.Body, if not nil.
+// Write implements http.ResponseWriter. The data in buf is written to
+// rw.Body, if not nil.
 func (rw *ResponseRecorder) Write(buf []byte) (int, error) {
 	rw.writeHeader(buf, "")
 	if rw.Body != nil {
@@ -86,7 +111,8 @@ func (rw *ResponseRecorder) Write(buf []byte) (int, error) {
 	return len(buf), nil
 }
 
-// WriteString always succeeds and writes to rw.Body, if not nil.
+// WriteString implements io.StringWriter. The data in str is written
+// to rw.Body, if not nil.
 func (rw *ResponseRecorder) WriteString(str string) (int, error) {
 	rw.writeHeader(nil, str)
 	if rw.Body != nil {
@@ -95,8 +121,7 @@ func (rw *ResponseRecorder) WriteString(str string) (int, error) {
 	return len(str), nil
 }
 
-// WriteHeader sets rw.Code. After it is called, changing rw.Header
-// will not affect rw.HeaderMap.
+// WriteHeader implements http.ResponseWriter.
 func (rw *ResponseRecorder) WriteHeader(code int) {
 	if rw.wroteHeader {
 		return
@@ -106,20 +131,11 @@ func (rw *ResponseRecorder) WriteHeader(code int) {
 	if rw.HeaderMap == nil {
 		rw.HeaderMap = make(http.Header)
 	}
-	rw.snapHeader = cloneHeader(rw.HeaderMap)
+	rw.snapHeader = rw.HeaderMap.Clone()
 }
 
-func cloneHeader(h http.Header) http.Header {
-	h2 := make(http.Header, len(h))
-	for k, vv := range h {
-		vv2 := make([]string, len(vv))
-		copy(vv2, vv)
-		h2[k] = vv2
-	}
-	return h2
-}
-
-// Flush sets rw.Flushed to true.
+// Flush implements http.Flusher. To test whether Flush was
+// called, see rw.Flushed.
 func (rw *ResponseRecorder) Flush() {
 	if !rw.wroteHeader {
 		rw.WriteHeader(200)
@@ -147,7 +163,7 @@ func (rw *ResponseRecorder) Result() *http.Response {
 		return rw.result
 	}
 	if rw.snapHeader == nil {
-		rw.snapHeader = cloneHeader(rw.HeaderMap)
+		rw.snapHeader = rw.HeaderMap.Clone()
 	}
 	res := &http.Response{
 		Proto:      "HTTP/1.1",
@@ -160,24 +176,22 @@ func (rw *ResponseRecorder) Result() *http.Response {
 	if res.StatusCode == 0 {
 		res.StatusCode = 200
 	}
-	res.Status = http.StatusText(res.StatusCode)
+	res.Status = fmt.Sprintf("%03d %s", res.StatusCode, http.StatusText(res.StatusCode))
 	if rw.Body != nil {
 		res.Body = ioutil.NopCloser(bytes.NewReader(rw.Body.Bytes()))
+	} else {
+		res.Body = http.NoBody
 	}
 	res.ContentLength = parseContentLength(res.Header.Get("Content-Length"))
 
 	if trailers, ok := rw.snapHeader["Trailer"]; ok {
 		res.Trailer = make(http.Header, len(trailers))
 		for _, k := range trailers {
-			// TODO: use http2.ValidTrailerHeader, but we can't
-			// get at it easily because it's bundled into net/http
-			// unexported. This is good enough for now:
-			switch k {
-			case "Transfer-Encoding", "Content-Length", "Trailer":
-				// Ignore since forbidden by RFC 2616 14.40.
+			k = http.CanonicalHeaderKey(k)
+			if !httpguts.ValidTrailerHeader(k) {
+				// Ignore since forbidden by RFC 7230, section 4.1.2.
 				continue
 			}
-			k = http.CanonicalHeaderKey(k)
 			vv, ok := rw.HeaderMap[k]
 			if !ok {
 				continue
@@ -185,6 +199,17 @@ func (rw *ResponseRecorder) Result() *http.Response {
 			vv2 := make([]string, len(vv))
 			copy(vv2, vv)
 			res.Trailer[k] = vv2
+		}
+	}
+	for k, vv := range rw.HeaderMap {
+		if !strings.HasPrefix(k, http.TrailerPrefix) {
+			continue
+		}
+		if res.Trailer == nil {
+			res.Trailer = make(http.Header)
+		}
+		for _, v := range vv {
+			res.Trailer.Add(strings.TrimPrefix(k, http.TrailerPrefix), v)
 		}
 	}
 	return res

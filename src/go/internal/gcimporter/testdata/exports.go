@@ -7,9 +7,7 @@
 
 package exports
 
-import (
-	"go/ast"
-)
+import "go/ast"
 
 // Issue 3682: Correctly read dotted identifiers from export data.
 const init1 = 0
@@ -21,7 +19,7 @@ const (
 	C1     = 3.14159265
 	C2     = 2.718281828i
 	C3     = -123.456e-789
-	C4     = +123.456E+789
+	C4     = +123.456e+789
 	C5     = 1234i
 	C6     = "foo\n"
 	C7     = `bar\n`
@@ -77,7 +75,8 @@ type (
 
 var (
 	V0 int
-	V1 = -991.0
+	V1         = -991.0
+	V2 float32 = 1.2
 )
 
 func F1()         {}

@@ -6,8 +6,10 @@ package runtime_test
 
 import (
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 // Strings and slices that don't escape and fit into tmpBuf are stack allocated,
@@ -89,9 +91,61 @@ func BenchmarkConcatStringAndBytes(b *testing.B) {
 	}
 }
 
+var escapeString string
+
+func BenchmarkSliceByteToString(b *testing.B) {
+	buf := []byte{'!'}
+	for n := 0; n < 8; n++ {
+		b.Run(strconv.Itoa(len(buf)), func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				escapeString = string(buf)
+			}
+		})
+		buf = append(buf, buf...)
+	}
+}
+
 var stringdata = []struct{ name, data string }{
 	{"ASCII", "01234567890"},
 	{"Japanese", "日本語日本語日本語"},
+	{"MixedLength", "$Ѐࠀက퀀𐀀\U00040000\U0010FFFF"},
+}
+
+var sinkInt int
+
+func BenchmarkRuneCount(b *testing.B) {
+	// Each sub-benchmark counts the runes in a string in a different way.
+	b.Run("lenruneslice", func(b *testing.B) {
+		for _, sd := range stringdata {
+			b.Run(sd.name, func(b *testing.B) {
+				for i := 0; i < b.N; i++ {
+					sinkInt += len([]rune(sd.data))
+				}
+			})
+		}
+	})
+	b.Run("rangeloop", func(b *testing.B) {
+		for _, sd := range stringdata {
+			b.Run(sd.name, func(b *testing.B) {
+				for i := 0; i < b.N; i++ {
+					n := 0
+					for range sd.data {
+						n++
+					}
+					sinkInt += n
+				}
+			})
+		}
+	})
+	b.Run("utf8.RuneCountInString", func(b *testing.B) {
+		for _, sd := range stringdata {
+			b.Run(sd.name, func(b *testing.B) {
+				for i := 0; i < b.N; i++ {
+					sinkInt += utf8.RuneCountInString(sd.data)
+				}
+			})
+		}
+	})
 }
 
 func BenchmarkRuneIterate(b *testing.B) {
@@ -109,7 +163,7 @@ func BenchmarkRuneIterate(b *testing.B) {
 		for _, sd := range stringdata {
 			b.Run(sd.name, func(b *testing.B) {
 				for i := 0; i < b.N; i++ {
-					for _ = range sd.data {
+					for range sd.data {
 					}
 				}
 			})
@@ -119,7 +173,7 @@ func BenchmarkRuneIterate(b *testing.B) {
 		for _, sd := range stringdata {
 			b.Run(sd.name, func(b *testing.B) {
 				for i := 0; i < b.N; i++ {
-					for _, _ = range sd.data {
+					for range sd.data {
 					}
 				}
 			})
@@ -179,6 +233,34 @@ func TestCompareTempString(t *testing.T) {
 		if string(b) == s {
 		} else {
 			t.Fatalf("strings are not equal: '%v' and '%v'", string(b), s)
+		}
+	})
+	if n != 0 {
+		t.Fatalf("want 0 allocs, got %v", n)
+	}
+}
+
+func TestStringIndexHaystack(t *testing.T) {
+	// See issue 25864.
+	haystack := []byte("hello")
+	needle := "ll"
+	n := testing.AllocsPerRun(1000, func() {
+		if strings.Index(string(haystack), needle) != 2 {
+			t.Fatalf("needle not found")
+		}
+	})
+	if n != 0 {
+		t.Fatalf("want 0 allocs, got %v", n)
+	}
+}
+
+func TestStringIndexNeedle(t *testing.T) {
+	// See issue 25864.
+	haystack := "hello"
+	needle := []byte("ll")
+	n := testing.AllocsPerRun(1000, func() {
+		if strings.Index(haystack, string(needle)) != 2 {
+			t.Fatalf("needle not found")
 		}
 	})
 	if n != 0 {
@@ -276,5 +358,130 @@ func TestString2Slice(t *testing.T) {
 	r := ([]rune)(s)
 	if !isZeroedR(r[len(r):cap(r)]) {
 		t.Errorf("extra runes not zeroed")
+	}
+}
+
+const intSize = 32 << (^uint(0) >> 63)
+
+type atoi64Test struct {
+	in  string
+	out int64
+	ok  bool
+}
+
+var atoi64tests = []atoi64Test{
+	{"", 0, false},
+	{"0", 0, true},
+	{"-0", 0, true},
+	{"1", 1, true},
+	{"-1", -1, true},
+	{"12345", 12345, true},
+	{"-12345", -12345, true},
+	{"012345", 12345, true},
+	{"-012345", -12345, true},
+	{"12345x", 0, false},
+	{"-12345x", 0, false},
+	{"98765432100", 98765432100, true},
+	{"-98765432100", -98765432100, true},
+	{"20496382327982653440", 0, false},
+	{"-20496382327982653440", 0, false},
+	{"9223372036854775807", 1<<63 - 1, true},
+	{"-9223372036854775807", -(1<<63 - 1), true},
+	{"9223372036854775808", 0, false},
+	{"-9223372036854775808", -1 << 63, true},
+	{"9223372036854775809", 0, false},
+	{"-9223372036854775809", 0, false},
+}
+
+func TestAtoi(t *testing.T) {
+	switch intSize {
+	case 32:
+		for i := range atoi32tests {
+			test := &atoi32tests[i]
+			out, ok := runtime.Atoi(test.in)
+			if test.out != int32(out) || test.ok != ok {
+				t.Errorf("atoi(%q) = (%v, %v) want (%v, %v)",
+					test.in, out, ok, test.out, test.ok)
+			}
+		}
+	case 64:
+		for i := range atoi64tests {
+			test := &atoi64tests[i]
+			out, ok := runtime.Atoi(test.in)
+			if test.out != int64(out) || test.ok != ok {
+				t.Errorf("atoi(%q) = (%v, %v) want (%v, %v)",
+					test.in, out, ok, test.out, test.ok)
+			}
+		}
+	}
+}
+
+type atoi32Test struct {
+	in  string
+	out int32
+	ok  bool
+}
+
+var atoi32tests = []atoi32Test{
+	{"", 0, false},
+	{"0", 0, true},
+	{"-0", 0, true},
+	{"1", 1, true},
+	{"-1", -1, true},
+	{"12345", 12345, true},
+	{"-12345", -12345, true},
+	{"012345", 12345, true},
+	{"-012345", -12345, true},
+	{"12345x", 0, false},
+	{"-12345x", 0, false},
+	{"987654321", 987654321, true},
+	{"-987654321", -987654321, true},
+	{"2147483647", 1<<31 - 1, true},
+	{"-2147483647", -(1<<31 - 1), true},
+	{"2147483648", 0, false},
+	{"-2147483648", -1 << 31, true},
+	{"2147483649", 0, false},
+	{"-2147483649", 0, false},
+}
+
+func TestAtoi32(t *testing.T) {
+	for i := range atoi32tests {
+		test := &atoi32tests[i]
+		out, ok := runtime.Atoi32(test.in)
+		if test.out != out || test.ok != ok {
+			t.Errorf("atoi32(%q) = (%v, %v) want (%v, %v)",
+				test.in, out, ok, test.out, test.ok)
+		}
+	}
+}
+
+type parseReleaseTest struct {
+	in                  string
+	major, minor, patch int
+}
+
+var parseReleaseTests = []parseReleaseTest{
+	{"", -1, -1, -1},
+	{"x", -1, -1, -1},
+	{"5", 5, 0, 0},
+	{"5.12", 5, 12, 0},
+	{"5.12-x", 5, 12, 0},
+	{"5.12.1", 5, 12, 1},
+	{"5.12.1-x", 5, 12, 1},
+	{"5.12.1.0", 5, 12, 1},
+	{"5.20496382327982653440", -1, -1, -1},
+}
+
+func TestParseRelease(t *testing.T) {
+	for _, test := range parseReleaseTests {
+		major, minor, patch, ok := runtime.ParseRelease(test.in)
+		if !ok {
+			major, minor, patch = -1, -1, -1
+		}
+		if test.major != major || test.minor != minor || test.patch != patch {
+			t.Errorf("parseRelease(%q) = (%v, %v, %v) want (%v, %v, %v)",
+				test.in, major, minor, patch,
+				test.major, test.minor, test.patch)
+		}
 	}
 }

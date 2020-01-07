@@ -10,7 +10,7 @@
 // the syslog client will attempt to reconnect to the server
 // and write again.
 //
-// The syslog package is frozen and not accepting new features.
+// The syslog package is frozen and is not accepting new features.
 // Some external packages provide more functionality. See:
 //
 //   https://godoc.org/?q=syslog
@@ -22,5 +22,3 @@ package syslog
 // see https://golang.org/issue/1108.
 
 // BUG(akumar): This package is not implemented on Plan 9.
-
-// BUG(minux): This package is not implemented on NaCl (Native Client).

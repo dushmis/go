@@ -18,12 +18,16 @@ import (
 	"go/printer"
 	"go/token"
 	"io"
+	"io/ioutil"
 	"os"
 	"path/filepath"
 	"reflect"
 	"runtime"
 	"sort"
 	"strings"
+
+	"cmd/internal/edit"
+	"cmd/internal/objabi"
 )
 
 // A Package collects information about the package we're going to write.
@@ -39,9 +43,18 @@ type Package struct {
 	Name        map[string]*Name // accumulated Name from Files
 	ExpFunc     []*ExpFunc       // accumulated ExpFunc from Files
 	Decl        []ast.Decl
-	GoFiles     []string // list of Go files
-	GccFiles    []string // list of gcc output files
-	Preamble    string   // collected preamble for _cgo_export.h
+	GoFiles     []string        // list of Go files
+	GccFiles    []string        // list of gcc output files
+	Preamble    string          // collected preamble for _cgo_export.h
+	typedefs    map[string]bool // type names that appear in the types of the objects we're interested in
+	typedefList []typedefInfo
+}
+
+// A typedefInfo is an element on Package.typedefList: a typedef name
+// and the position where it was required.
+type typedefInfo struct {
+	typedef string
+	pos     token.Pos
 }
 
 // A File collects information about a single Go input file.
@@ -54,6 +67,12 @@ type File struct {
 	Calls    []*Call             // all calls to C.xxx in AST
 	ExpFunc  []*ExpFunc          // exported functions for this file
 	Name     map[string]*Name    // map from Go name to Name
+	NamePos  map[*Name]token.Pos // map from Name to position of the first reference
+	Edit     *edit.Buffer
+}
+
+func (f *File) offset(p token.Pos) int {
+	return fset.Position(p).Offset
 }
 
 func nameKeys(m map[string]*Name) []string {
@@ -69,18 +88,22 @@ func nameKeys(m map[string]*Name) []string {
 type Call struct {
 	Call     *ast.CallExpr
 	Deferred bool
+	Done     bool
 }
 
 // A Ref refers to an expression of the form C.xxx in the AST.
 type Ref struct {
 	Name    *Name
 	Expr    *ast.Expr
-	Context string // "type", "expr", "call", or "call2"
+	Context astContext
+	Done    bool
 }
 
 func (r *Ref) Pos() token.Pos {
 	return (*r.Expr).Pos()
 }
+
+var nameKinds = []string{"iconst", "fconst", "sconst", "type", "var", "fpvar", "func", "macro", "not-type"}
 
 // A Name collects information about C.xxx.
 type Name struct {
@@ -88,7 +111,7 @@ type Name struct {
 	Mangle   string // name used in generated Go
 	C        string // name used in C
 	Define   string // #define expansion
-	Kind     string // "const", "type", "var", "fpvar", "func", "not-type"
+	Kind     string // one of the nameKinds
 	Type     *Type  // the type of xxx
 	FuncType *FuncType
 	AddError bool
@@ -100,7 +123,12 @@ func (n *Name) IsVar() bool {
 	return n.Kind == "var" || n.Kind == "fpvar"
 }
 
-// A ExpFunc is an exported function, callable from C.
+// IsConst reports whether Kind is either "iconst", "fconst" or "sconst"
+func (n *Name) IsConst() bool {
+	return strings.HasSuffix(n.Kind, "const")
+}
+
+// An ExpFunc is an exported function, callable from C.
 // Such functions are identified in the Go input file
 // by doc comments containing the line //export ExpName
 type ExpFunc struct {
@@ -123,6 +151,7 @@ type Type struct {
 	Go         ast.Expr
 	EnumValues map[string]int64
 	Typedef    string
+	BadPointer bool
 }
 
 // A FuncType collects information about a function type in both the C and Go worlds.
@@ -143,12 +172,16 @@ var ptrSizeMap = map[string]int64{
 	"amd64":    8,
 	"arm":      4,
 	"arm64":    8,
+	"mips":     4,
+	"mipsle":   4,
 	"mips64":   8,
 	"mips64le": 8,
 	"ppc64":    8,
 	"ppc64le":  8,
+	"riscv64":  8,
 	"s390":     4,
 	"s390x":    8,
+	"sparc64":  8,
 }
 
 var intSizeMap = map[string]int64{
@@ -156,12 +189,16 @@ var intSizeMap = map[string]int64{
 	"amd64":    8,
 	"arm":      4,
 	"arm64":    8,
+	"mips":     4,
+	"mipsle":   4,
 	"mips64":   8,
 	"mips64le": 8,
 	"ppc64":    8,
 	"ppc64le":  8,
+	"riscv64":  8,
 	"s390":     4,
 	"s390x":    8,
+	"sparc64":  8,
 }
 
 var cPrefix string
@@ -178,6 +215,7 @@ var dynlinker = flag.Bool("dynlinker", false, "record dynamic linker information
 // constant values used in the host's C libraries and system calls.
 var godefs = flag.Bool("godefs", false, "for bootstrap: write Go definitions for C file to standard output")
 
+var srcDir = flag.String("srcdir", "", "source directory")
 var objDir = flag.String("objdir", "", "object directory")
 var importPath = flag.String("importpath", "", "import path of package being built (for comments in generated files)")
 var exportHeader = flag.String("exportheader", "", "where to write export header if any exported functions")
@@ -185,11 +223,14 @@ var exportHeader = flag.String("exportheader", "", "where to write export header
 var gccgo = flag.Bool("gccgo", false, "generate files for use with gccgo")
 var gccgoprefix = flag.String("gccgoprefix", "", "-fgo-prefix option used with gccgo")
 var gccgopkgpath = flag.String("gccgopkgpath", "", "-fgo-pkgpath option used with gccgo")
+var gccgoMangleCheckDone bool
+var gccgoNewmanglingInEffect bool
 var importRuntimeCgo = flag.Bool("import_runtime_cgo", true, "import runtime/cgo in generated code")
 var importSyscall = flag.Bool("import_syscall", true, "import syscall in generated code")
 var goarch, goos string
 
 func main() {
+	objabi.AddVersionFlag() // -V
 	flag.Usage = usage
 	flag.Parse()
 
@@ -236,6 +277,9 @@ func main() {
 		if arg == "-fsanitize=thread" {
 			tsanProlog = yesTsanProlog
 		}
+		if arg == "-fsanitize=memory" {
+			msanProlog = yesMsanProlog
+		}
 	}
 
 	p := newPackage(args[:i])
@@ -255,23 +299,29 @@ func main() {
 	// concern is other cgo wrappers for the same functions.
 	// Use the beginning of the md5 of the input to disambiguate.
 	h := md5.New()
-	for _, input := range goFiles {
-		f, err := os.Open(input)
+	io.WriteString(h, *importPath)
+	fs := make([]*File, len(goFiles))
+	for i, input := range goFiles {
+		if *srcDir != "" {
+			input = filepath.Join(*srcDir, input)
+		}
+
+		b, err := ioutil.ReadFile(input)
 		if err != nil {
 			fatalf("%s", err)
 		}
-		io.Copy(h, f)
-		f.Close()
-	}
-	cPrefix = fmt.Sprintf("_%x", h.Sum(nil)[0:6])
+		if _, err = h.Write(b); err != nil {
+			fatalf("%s", err)
+		}
 
-	fs := make([]*File, len(goFiles))
-	for i, input := range goFiles {
 		f := new(File)
-		f.ReadGo(input)
+		f.Edit = edit.NewBuffer(b)
+		f.ParseGo(input, b)
 		f.DiscardCgoDirectives()
 		fs[i] = f
 	}
+
+	cPrefix = fmt.Sprintf("_%x", h.Sum(nil)[0:6])
 
 	if *objDir == "" {
 		// make sure that _obj directory exists, so that we can write
@@ -286,11 +336,13 @@ func main() {
 		p.Translate(f)
 		for _, cref := range f.Ref {
 			switch cref.Context {
-			case "call", "call2":
+			case ctxCall, ctxCall2:
 				if cref.Name.Kind != "type" {
 					break
 				}
+				old := *cref.Expr
 				*cref.Expr = cref.Name.Type.Go
+				f.Edit.Replace(f.offset(old.Pos()), f.offset(old.End()), gofmt(cref.Name.Type.Go))
 			}
 		}
 		if nerrors > 0 {
@@ -361,6 +413,14 @@ func (p *Package) Record(f *File) {
 		for k, v := range f.Name {
 			if p.Name[k] == nil {
 				p.Name[k] = v
+			} else if p.incompleteTypedef(p.Name[k].Type) {
+				p.Name[k] = v
+			} else if p.incompleteTypedef(v.Type) {
+				// Nothing to do.
+			} else if _, ok := nameToC[k]; ok {
+				// Names we predefine may appear inconsistent
+				// if some files typedef them and some don't.
+				// Issue 26743.
 			} else if !reflect.DeepEqual(p.Name[k], v) {
 				error_(token.NoPos, "inconsistent definitions for C.%s", fixGo(k))
 			}
@@ -372,4 +432,10 @@ func (p *Package) Record(f *File) {
 		p.Preamble += "\n" + f.Preamble
 	}
 	p.Decl = append(p.Decl, f.AST.Decls...)
+}
+
+// incompleteTypedef reports whether t appears to be an incomplete
+// typedef definition.
+func (p *Package) incompleteTypedef(t *Type) bool {
+	return t == nil || (t.Size == 0 && t.Align == -1)
 }

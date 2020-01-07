@@ -5,6 +5,8 @@
 package ssa
 
 import (
+	"cmd/compile/internal/types"
+	"cmd/internal/src"
 	"fmt"
 	"sort"
 )
@@ -30,23 +32,21 @@ func cse(f *Func) {
 
 	// Make initial coarse partitions by using a subset of the conditions above.
 	a := make([]*Value, 0, f.NumValues())
-	auxIDs := auxmap{}
+	if f.auxmap == nil {
+		f.auxmap = auxmap{}
+	}
 	for _, b := range f.Blocks {
 		for _, v := range b.Values {
-			if auxIDs[v.Aux] == 0 {
-				auxIDs[v.Aux] = int32(len(auxIDs)) + 1
-			}
 			if v.Type.IsMemory() {
 				continue // memory values can never cse
 			}
-			if opcodeTable[v.Op].commutative && len(v.Args) == 2 && v.Args[1].ID < v.Args[0].ID {
-				// Order the arguments of binary commutative operations.
-				v.Args[0], v.Args[1] = v.Args[1], v.Args[0]
+			if f.auxmap[v.Aux] == 0 {
+				f.auxmap[v.Aux] = int32(len(f.auxmap)) + 1
 			}
 			a = append(a, v)
 		}
 	}
-	partition := partitionValues(a, auxIDs)
+	partition := partitionValues(a, f.auxmap)
 
 	// map from value id back to eqclass id
 	valueEqClass := make([]ID, f.NumValues())
@@ -83,6 +83,7 @@ func cse(f *Func) {
 	// non-equivalent arguments.  Repeat until we can't find any
 	// more splits.
 	var splitPoints []int
+	byArgClass := new(partitionByArgClass) // reuseable partitionByArgClass to reduce allocations
 	for {
 		changed := false
 
@@ -91,13 +92,25 @@ func cse(f *Func) {
 		for i := 0; i < len(partition); i++ {
 			e := partition[i]
 
+			if opcodeTable[e[0].Op].commutative {
+				// Order the first two args before comparison.
+				for _, v := range e {
+					if valueEqClass[v.Args[0].ID] > valueEqClass[v.Args[1].ID] {
+						v.Args[0], v.Args[1] = v.Args[1], v.Args[0]
+					}
+				}
+			}
+
 			// Sort by eq class of arguments.
-			sort.Sort(partitionByArgClass{e, valueEqClass})
+			byArgClass.a = e
+			byArgClass.eqClass = valueEqClass
+			sort.Sort(byArgClass)
 
 			// Find split points.
 			splitPoints = append(splitPoints[:0], 0)
 			for j := 1; j < len(e); j++ {
 				v, w := e[j-1], e[j]
+				// Note: commutative args already correctly ordered by byArgClass.
 				eqArgs := true
 				for k, a := range v.Args {
 					b := w.Args[k]
@@ -142,13 +155,16 @@ func cse(f *Func) {
 		}
 	}
 
-	sdom := f.sdom()
+	sdom := f.Sdom()
 
 	// Compute substitutions we would like to do. We substitute v for w
 	// if v and w are in the same equivalence class and v dominates w.
 	rewrite := make([]*Value, f.NumValues())
+	byDom := new(partitionByDom) // reusable partitionByDom to reduce allocs
 	for _, e := range partition {
-		sort.Sort(partitionByDom{e, sdom})
+		byDom.a = e
+		byDom.sdom = sdom
+		sort.Sort(byDom)
 		for i := 0; i < len(e)-1; i++ {
 			// e is sorted by domorder, so a maximal dominant element is first in the slice
 			v := e[i]
@@ -163,7 +179,7 @@ func cse(f *Func) {
 				if w == nil {
 					continue
 				}
-				if sdom.isAncestorEq(v.Block, w.Block) {
+				if sdom.IsAncestorEq(v.Block, w.Block) {
 					rewrite[w.ID] = v
 					e[j] = nil
 				} else {
@@ -182,7 +198,10 @@ func cse(f *Func) {
 	for _, b := range f.Blocks {
 	out:
 		for _, v := range b.Values {
-			if rewrite[v.ID] != nil {
+			// New values are created when selectors are copied to
+			// a new block. We can safely ignore those new values,
+			// since they have already been copied (issue 17918).
+			if int(v.ID) >= len(rewrite) || rewrite[v.ID] != nil {
 				continue
 			}
 			if v.Op != OpSelect0 && v.Op != OpSelect1 {
@@ -215,19 +234,28 @@ func cse(f *Func) {
 		for _, v := range b.Values {
 			for i, w := range v.Args {
 				if x := rewrite[w.ID]; x != nil {
+					if w.Pos.IsStmt() == src.PosIsStmt {
+						// about to lose a statement marker, w
+						// w is an input to v; if they're in the same block
+						// and the same line, v is a good-enough new statement boundary.
+						if w.Block == v.Block && w.Pos.Line() == v.Pos.Line() {
+							v.Pos = v.Pos.WithIsStmt()
+							w.Pos = w.Pos.WithNotStmt()
+						} // TODO and if this fails?
+					}
 					v.SetArg(i, x)
 					rewrites++
 				}
 			}
 		}
-		if v := b.Control; v != nil {
+		for i, v := range b.ControlValues() {
 			if x := rewrite[v.ID]; x != nil {
 				if v.Op == OpNilCheck {
 					// nilcheck pass will remove the nil checks and log
 					// them appropriately, so don't mess with them here.
 					continue
 				}
-				b.SetControl(x)
+				b.ReplaceControl(i, x)
 			}
 		}
 	}
@@ -264,7 +292,7 @@ func partitionValues(a []*Value, auxIDs auxmap) []eqclass {
 		j := 1
 		for ; j < len(a); j++ {
 			w := a[j]
-			if cmpVal(v, w, auxIDs) != CMPeq {
+			if cmpVal(v, w, auxIDs) != types.CMPeq {
 				break
 			}
 		}
@@ -276,16 +304,16 @@ func partitionValues(a []*Value, auxIDs auxmap) []eqclass {
 
 	return partition
 }
-func lt2Cmp(isLt bool) Cmp {
+func lt2Cmp(isLt bool) types.Cmp {
 	if isLt {
-		return CMPlt
+		return types.CMPlt
 	}
-	return CMPgt
+	return types.CMPgt
 }
 
 type auxmap map[interface{}]int32
 
-func cmpVal(v, w *Value, auxIDs auxmap) Cmp {
+func cmpVal(v, w *Value, auxIDs auxmap) types.Cmp {
 	// Try to order these comparison by cost (cheaper first)
 	if v.Op != w.Op {
 		return lt2Cmp(v.Op < w.Op)
@@ -304,22 +332,26 @@ func cmpVal(v, w *Value, auxIDs auxmap) Cmp {
 		// that generate memory.
 		return lt2Cmp(v.ID < w.ID)
 	}
-
-	if tc := v.Type.Compare(w.Type); tc != CMPeq {
-		return tc
+	// OpSelect is a pseudo-op. We need to be more aggressive
+	// regarding CSE to keep multiple OpSelect's of the same
+	// argument from existing.
+	if v.Op != OpSelect0 && v.Op != OpSelect1 {
+		if tc := v.Type.Compare(w.Type); tc != types.CMPeq {
+			return tc
+		}
 	}
 
 	if v.Aux != w.Aux {
 		if v.Aux == nil {
-			return CMPlt
+			return types.CMPlt
 		}
 		if w.Aux == nil {
-			return CMPgt
+			return types.CMPgt
 		}
 		return lt2Cmp(auxIDs[v.Aux] < auxIDs[w.Aux])
 	}
 
-	return CMPeq
+	return types.CMPeq
 }
 
 // Sort values to make the initial partition.
@@ -333,8 +365,8 @@ func (sv sortvalues) Swap(i, j int) { sv.a[i], sv.a[j] = sv.a[j], sv.a[i] }
 func (sv sortvalues) Less(i, j int) bool {
 	v := sv.a[i]
 	w := sv.a[j]
-	if cmp := cmpVal(v, w, sv.auxIDs); cmp != CMPeq {
-		return cmp == CMPlt
+	if cmp := cmpVal(v, w, sv.auxIDs); cmp != types.CMPeq {
+		return cmp == types.CMPlt
 	}
 
 	// Sort by value ID last to keep the sort result deterministic.

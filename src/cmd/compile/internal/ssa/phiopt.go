@@ -24,7 +24,7 @@ package ssa
 //
 // In this case we can replace x with a copy of b.
 func phiopt(f *Func) {
-	sdom := f.sdom()
+	sdom := f.Sdom()
 	for _, b := range f.Blocks {
 		if len(b.Preds) != 2 || len(b.Values) == 0 {
 			// TODO: handle more than 2 predecessors, e.g. a || b || c.
@@ -79,9 +79,9 @@ func phiopt(f *Func) {
 				if v.Args[reverse].AuxInt != v.Args[1-reverse].AuxInt {
 					ops := [2]Op{OpNot, OpCopy}
 					v.reset(ops[v.Args[reverse].AuxInt])
-					v.AddArg(b0.Control)
+					v.AddArg(b0.Controls[0])
 					if f.pass.debug > 0 {
-						f.Config.Warnl(b.Line, "converted OpPhi to %v", v.Op)
+						f.Warnl(b.Pos, "converted OpPhi to %v", v.Op)
 					}
 					continue
 				}
@@ -93,11 +93,11 @@ func phiopt(f *Func) {
 			// value is always computed. This guarantees that the side effects
 			// of value are not seen if a is false.
 			if v.Args[reverse].Op == OpConstBool && v.Args[reverse].AuxInt == 1 {
-				if tmp := v.Args[1-reverse]; sdom.isAncestorEq(tmp.Block, b) {
+				if tmp := v.Args[1-reverse]; sdom.IsAncestorEq(tmp.Block, b) {
 					v.reset(OpOrB)
-					v.SetArgs2(b0.Control, tmp)
+					v.SetArgs2(b0.Controls[0], tmp)
 					if f.pass.debug > 0 {
-						f.Config.Warnl(b.Line, "converted OpPhi to %v", v.Op)
+						f.Warnl(b.Pos, "converted OpPhi to %v", v.Op)
 					}
 					continue
 				}
@@ -109,11 +109,11 @@ func phiopt(f *Func) {
 			// value is always computed. This guarantees that the side effects
 			// of value are not seen if a is false.
 			if v.Args[1-reverse].Op == OpConstBool && v.Args[1-reverse].AuxInt == 0 {
-				if tmp := v.Args[reverse]; sdom.isAncestorEq(tmp.Block, b) {
+				if tmp := v.Args[reverse]; sdom.IsAncestorEq(tmp.Block, b) {
 					v.reset(OpAndB)
-					v.SetArgs2(b0.Control, tmp)
+					v.SetArgs2(b0.Controls[0], tmp)
 					if f.pass.debug > 0 {
-						f.Config.Warnl(b.Line, "converted OpPhi to %v", v.Op)
+						f.Warnl(b.Pos, "converted OpPhi to %v", v.Op)
 					}
 					continue
 				}
@@ -161,14 +161,14 @@ func phioptint(v *Value, b0 *Block, reverse int) {
 		v.Fatalf("bad int size %d", v.Type.Size())
 	}
 
-	a := b0.Control
+	a := b0.Controls[0]
 	if negate {
-		a = v.Block.NewValue1(v.Line, OpNot, a.Type, a)
+		a = v.Block.NewValue1(v.Pos, OpNot, a.Type, a)
 	}
 	v.AddArg(a)
 
 	f := b0.Func
 	if f.pass.debug > 0 {
-		f.Config.Warnl(v.Block.Line, "converted OpPhi bool -> int%d", v.Type.Size()*8)
+		f.Warnl(v.Block.Pos, "converted OpPhi bool -> int%d", v.Type.Size()*8)
 	}
 }
